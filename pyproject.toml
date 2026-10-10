@@ -1,0 +1,15 @@
+[project]
+name = "worldsim"
+version = "0.1.0"
+description = "A voice-played simulation of real life on Earth"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+]
+
+# Step 0 only needs the freedom-test script to run, so nothing is built or
+# installed as a package yet. Milestone 1's project setup step adds the
+# src/worldsim layout, pydantic, and pytest.
+[tool.uv]
+package = false
