@@ -15,9 +15,9 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .budget import as_prompt, estimate_tokens, take_within
+from .budget import SEAM, as_prompt, estimate_tokens, take_within
 from .config import Config
-from .llm import _BaseLLM
+from .llm import RETRY_ROOM, _BaseLLM
 from .store import Store
 
 # The player character always has this id, so code never has to guess it.
@@ -35,6 +35,44 @@ QUANTITY_SUFFIXES = ("_usd", "_cents", "_count", "_qty")
 
 def is_quantity(key: str) -> bool:
     return key.endswith(QUANTITY_SUFFIXES)
+
+
+# Facts are forever (rule 3), so a fact is the wrong home for anything that
+# changes every turn. A live playtest settled `posture = "sitting on a bench"`
+# on the player, and because a second live value for a key is refused rather
+# than treated as a change, it still said that after they had walked home — and
+# nothing could correct it.
+#
+# Two kinds are refused outright. These restate what the store already models
+# structurally: an entity's place is `location_id`, and what is in a place comes
+# from its contents.
+STRUCTURAL_KEYS = frozenset(
+    {"location", "location_id", "position", "whereabouts", "occupants",
+     "contents", "inside", "contains"}
+)
+# And these are momentary by nature. Durable condition is a different thing and
+# stays a fact: a broken wrist, a debt, a fever are all true tomorrow.
+MOMENTARY_KEYS = frozenset(
+    {"posture", "activity", "action", "current_action", "currently", "doing",
+     "stance", "phone_action", "frustration", "hunger_level", "state"}
+)
+
+
+def not_a_fact(key: str) -> str | None:
+    """Why this key cannot be a fact, or None if it can be."""
+    plain = key.lower()
+    if plain in STRUCTURAL_KEYS:
+        return (
+            f"{key!r} restates where something is, which the store already "
+            "holds as the entity's location. Move it, do not describe it"
+        )
+    if plain in MOMENTARY_KEYS:
+        return (
+            f"{key!r} changes from turn to turn, and a fact is permanent. "
+            "Leave it out — where they are and what they were doing are "
+            "already known. Lasting condition is still a fact"
+        )
+    return None
 
 
 def as_text(value: str | float) -> str:
@@ -62,6 +100,19 @@ def as_number(key: str, value: str | float) -> float:
 # is far more expensive than the tokens saved.
 SOURCE_LETTERS = {"r": "real-data", "w": "world-knowledge", "i": "invented"}
 VISIBILITY_LETTERS = {"o": "obvious", "n": "noticeable", "h": "hidden"}
+
+
+def _no_nulls(data):
+    """Read `"dialogue": null` as "there was none".
+
+    A live turn lost its scene and its ledger to exactly that: the model wrote
+    null where it had nothing to add, which is what null means. The objects
+    after the opening cannot be retried, so leniency costs nothing and
+    strictness cost the turn's consequences.
+    """
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if v is not None}
+    return data
 
 
 def _expand(data, fields: tuple[str, ...], codes: dict):
@@ -130,8 +181,13 @@ class Supersede(BaseModel):
     # A live turn was lost to that, so accept it and render it as text; a real
     # quantity is refused below either way.
     value: str | float
-    source: Source
-    visibility: Visibility
+    # Defaulted for the same reason NewFact defaults them: a live playtest lost
+    # a whole ledger — the player's move and their money with it — because the
+    # model wrote a supersession without these two. The ledger arrives after the
+    # turn is committed and narrated, so it cannot be retried, which makes
+    # leniency here worth far more than precision.
+    source: Source = "invented"
+    visibility: Visibility = "obvious"
 
     @model_validator(mode="after")
     def quantities_are_never_superseded(self) -> Supersede:
@@ -144,6 +200,11 @@ class Supersede(BaseModel):
         return self
 
 
+# Facts, entities and perceptions go on the wire as arrays, so a model that has
+# been writing arrays all turn writes them for the ledger's entries too. These
+# used to be dict-only, and a `moves` entry written as an array took the whole
+# ledger down with it — which, arriving after the turn is committed, cannot be
+# retried. Every shape the ledger carries accepts both forms.
 class Delta(BaseModel):
     """A change to a quantity. The model never writes the new total."""
 
@@ -151,10 +212,20 @@ class Delta(BaseModel):
     key: str
     delta: float
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(data, ("entity_id", "key", "delta"), {})
+
 
 class Move(BaseModel):
     entity_id: str
     location_id: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(data, ("entity_id", "location_id"), {})
 
 
 class Learned(BaseModel):
@@ -165,6 +236,13 @@ class Learned(BaseModel):
     key: str
     how: str
     belief: str | float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(
+            data, ("mind_id", "entity_id", "key", "how", "belief"), {}
+        )
 
 
 class Line(BaseModel):
@@ -225,7 +303,18 @@ class Opening(BaseModel):
     sooner the last one lands the sooner the player hears something.
     """
 
-    intent: str
+    # Not required, though it is the first field asked for. A live turn was
+    # refused outright because the model wrote the location and the facts and
+    # simply left this out, twice. It is a convenience — a label for the log and
+    # context for the narrator — and losing a whole turn over a label is the
+    # worst trade in the engine. Code falls back to the player's own words,
+    # which never reach the narrator.
+    @model_validator(mode="before")
+    @classmethod
+    def drop_nulls(cls, data):
+        return _no_nulls(data)
+
+    intent: str = ""
     duration_minutes: float = Field(ge=0)
     player_location: str
     # True when a roll decides the turn. The opening then holds only what is
@@ -245,7 +334,12 @@ class Scene(BaseModel):
     the place first, then the person in it.
     """
 
-    summary: str
+    @model_validator(mode="before")
+    @classmethod
+    def drop_nulls(cls, data):
+        return _no_nulls(data)
+
+    summary: str = ""
     you_said_aloud: str | None = None
     new_entities: list[NewEntity] = Field(default_factory=list)
     new_facts: list[NewFact] = Field(default_factory=list)
@@ -260,6 +354,11 @@ class Ledger(BaseModel):
     Committed after the narration has already gone out, because none of it
     changes what this turn sounds like.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_nulls(cls, data):
+        return _no_nulls(data)
 
     superseded: list[Supersede] = Field(default_factory=list)
     deltas: list[Delta] = Field(default_factory=list)
@@ -286,6 +385,14 @@ STATIONS: tuple[tuple[int, str], ...] = (
     (6, "wealthy: money is not a question this person has to ask, which is its "
         "own kind of trap"),
 )
+
+
+def _regroup(entries: list[tuple[str, str, dict]]) -> dict:
+    """Facts back into the nested shape resolver.md documents."""
+    out: dict[str, dict] = {}
+    for entity_id, key, value in entries:
+        out.setdefault(entity_id, {})[key] = value
+    return out
 
 
 def draw_station(rng: random.Random) -> str:
@@ -324,7 +431,12 @@ class Resolver:
         user = as_prompt(
             {
                 "city": self.config.spawn_city,
-                "local_time": self.store.now().isoformat(),
+                # UTC, and labelled as such. It used to be sent as "local_time"
+                # while carrying UTC, so a 1:24pm world opened on "the last
+                # light of day fading" and scheduled dinner five hours late.
+                # The zone is not settled until the model writes it below, so
+                # UTC with an honest name is the best that can be offered here.
+                "utc_time": self.store.now().isoformat(),
                 "player_entity_id": PLAYER_ID,
                 "city_entity_id": SPAWN_PLACE_ID,
                 "station_in_life": station,
@@ -339,15 +451,31 @@ class Resolver:
         on_object: Callable[[int, object], None],
     ) -> tuple[Opening, Scene, Ledger]:
         """Stream one call. `on_object` fires as each of the three is valid."""
+        # Imported here, not at module scope: sheet.py reads PLAYER_ID from
+        # this module, so a top-level import would close the loop.
+        from .sheet import time_of_day
+
         # Spec 5.2's priority order: the instructions have the first claim on
         # the budget, then what the player just said, then the facts where they
         # are standing, then the scene so far. So the oldest turn is what goes
         # when something has to.
         system = self._prompt("resolver.md")
-        budget = self.config.token_budgets["resolver"] - estimate_tokens(system)
+        # The retry appends its explanation to this prompt, so the room for it
+        # is held back rather than discovered afterwards.
+        budget = (
+            self.config.token_budgets["resolver"]
+            - estimate_tokens(system)
+            - RETRY_ROOM
+            - SEAM
+        )
         payload: dict = {
             "player_said": player_said,
-            "world_time": self.store.now().isoformat(),
+            # Local, in plain words, and not the raw UTC stamp this used to be.
+            # The resolver settles the facts, so when it read 20:01 UTC as
+            # evening it wrote "city skyline at dusk" onto a kitchen window at
+            # three in the afternoon — and that is now permanently true.
+            "the_time": time_of_day(self.store),
+            "world_time_utc": self.store.now().isoformat(),
             "recent_turns": [],
             "truth_here": {},
         }
@@ -357,9 +485,17 @@ class Resolver:
         payload["recent_turns"] = list(
             reversed(take_within(list(reversed(recent)), max(room, 0)))
         )
-        # And then make it certain rather than estimated, oldest turn first.
-        while estimate_tokens(payload) > budget and payload["recent_turns"]:
-            payload["recent_turns"].pop(0)
+        # And then make it certain rather than estimated: the oldest turn goes
+        # first, and once those are gone the least important fact slice does.
+        # Trimming only the turns left the bound a token or two soft, because
+        # the JSON keys around `facts` are not in the slices that were measured.
+        while estimate_tokens(payload) > budget:
+            if payload["recent_turns"]:
+                payload["recent_turns"].pop(0)
+            elif len(payload["truth_here"].get("facts", {})) > 1:
+                payload["truth_here"]["facts"].popitem()
+            else:
+                break  # the instructions alone are over; nothing left to give
         user = as_prompt(payload)
         opening, scene, ledger = self.llm.stream_objects(
             "resolver",
@@ -380,14 +516,43 @@ class Resolver:
         it arrive it is already committed and narrated, so their problems are
         reported as dropped writes instead.
         """
-        will_exist = {e.id for e in opening.new_entities}
+        proposed = {e.id: e.location_id for e in opening.new_entities}
         where = opening.player_location
-        if self.store.entity(where) is None and where not in will_exist:
+        if self.store.entity(where) is None and where not in proposed:
             raise ValueError(
                 f"player_location is {where!r}, which does not exist and is not "
                 "created in this opening. Add it to new_entities, nested inside "
                 "a place that does exist."
             )
+
+        # Where the player ends up has to be reachable, all the way out. A live
+        # playtest put a restaurant inside `place:downtown`, which had never
+        # been settled: the restaurant was dropped, every fact on it went with
+        # it, the player was left standing in their car — and the narration
+        # walked them to a table anyway. The check above passed, because the
+        # restaurant *was* in new_entities; nobody asked about its parent.
+        #
+        # Only the player's own chain is enforced. An entity off to one side
+        # with nowhere to live is harmless and stays a reported dropped write;
+        # this one is the difference between the truth and the narration.
+        seen = {where}
+        parent = proposed.get(where)
+        while parent is not None and self.store.entity(parent) is None:
+            if parent not in proposed:
+                raise ValueError(
+                    f"player_location {where!r} is nested inside {parent!r}, "
+                    "which does not exist and is not created here either, so "
+                    "neither of them can be committed. Nest it inside a place "
+                    "that already exists — put the building straight in the "
+                    "city rather than inventing a neighbourhood to hold it."
+                )
+            if parent in seen:
+                raise ValueError(
+                    f"the places holding {where!r} are nested inside each "
+                    "other in a loop: {sorted(seen)}. Nothing contains itself."
+                )
+            seen.add(parent)
+            parent = proposed[parent]
 
     def check_deltas(self, ledger: Ledger, *settled_in: object) -> list[str]:
         """Deltas that cannot be applied, for the dev view and the log."""
@@ -449,20 +614,28 @@ class Resolver:
 
         ordered = [PLAYER_ID] + ([here] if here else [])
         ordered += [e.id for e in carried] + [e.id for e in present]
+
+        # Flattened to one entry per fact, not one per entity, so the trim is
+        # smooth. A place the player keeps returning to accumulates facts
+        # without limit, and a whole-entity slice could blow the budget on its
+        # own — the bar in the 500-turn test is a single entity holding 500
+        # facts. Within an entity the oldest come first: the name and the shape
+        # of the place were settled before the incidental detail.
+        entries: list[tuple[str, str, dict]] = []
         seen: set[str] = set()
-        slices = []
         for entity_id in ordered:
             if entity_id in seen:
                 continue
             seen.add(entity_id)
-            slices.append((entity_id, facts_of(entity_id)))
+            for key, value in facts_of(entity_id).items():
+                entries.append((entity_id, key, value))
 
         room = budget_tokens - estimate_tokens(frame)
-        kept = take_within(slices, max(room, 0))
-        frame["facts"] = dict(kept)
+        kept = take_within(entries, max(room, 0))
+        frame["facts"] = _regroup(kept)
         # Exactly as in render.context: the estimate above ignores the JSON
         # overhead of the keys themselves, and spec 5.2 is a hard bound.
         while estimate_tokens(frame) > budget_tokens and len(kept) > 1:
             kept.pop()
-            frame["facts"] = dict(kept)
+            frame["facts"] = _regroup(kept)
         return frame

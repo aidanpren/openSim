@@ -386,3 +386,122 @@ def test_the_narrator_is_never_given_the_players_own_words(store, config, call_l
         assert said not in prompt
     # The resolver's reading of it does get through, so a question still lands.
     assert "promise the bartender the money on Friday" in narrator_prompts[-1]
+
+
+# ---- defect 1, the second time (found live, playtest-20261011) ----
+
+
+def test_a_destination_whose_parent_does_not_exist_is_refused(store, config, call_log):
+    """The player was narrated into a restaurant they were never moved to.
+
+    `check_opening` asked whether `player_location` existed or was being
+    created, and the restaurant *was* being created — inside `place:downtown`,
+    which had never been settled. So the restaurant was dropped, every fact on
+    it was dropped, the player stayed in their car, and the narration walked
+    them to a table. Rejecting it spends the retry instead.
+    """
+    unreachable = reply(
+        intent="go into the restaurant",
+        player_location="place:bistro",
+        summary="you go in",
+        new_entities=[
+            ["place:bistro", "place", "Le Petit Bistro", "place:downtown"],
+        ],
+    )
+    recovered = reply(
+        intent="go into the restaurant",
+        player_location="place:bistro",
+        summary="you go in",
+        new_entities=[["place:bistro", "place", "Le Petit Bistro", "place:spawn-city"]],
+    )
+    llm = FakeLLM(
+        config, call_log,
+        {"resolver": [SPAWN, unreachable, recovered],
+         "narrator": ["Quiet.", "The door closes behind you."]},
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+
+    result = turn.play("I go inside", life)
+
+    # The retry fired and the second attempt nested it somewhere real.
+    assert store.entity("place:bistro") is not None
+    assert store.entity(PLAYER_ID).location_id == "place:bistro"
+    assert result.dropped == []
+
+
+def test_the_reason_reaches_the_model_on_the_retry(store, config, call_log):
+    unreachable = reply(
+        player_location="place:bistro",
+        new_entities=[["place:bistro", "place", "Le Petit Bistro", "place:downtown"]],
+    )
+    llm = FakeLLM(
+        config, call_log,
+        {"resolver": [SPAWN, unreachable, unreachable], "narrator": ["Quiet."]},
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+
+    with pytest.raises(ModelCallFailed):
+        turn.play("I go inside", life)
+
+    retry = [u for role, _, u in llm.prompts if role == "resolver"][-1]
+    assert "place:downtown" in retry
+    assert "nested inside" in retry
+    # And nothing was committed on the way through.
+    assert store.entity("place:bistro") is None
+
+
+def test_an_entity_off_to_one_side_is_reparented_not_lost(store, config, call_log):
+    """Only the player's own chain is fatal. The rest is corrected, not lost.
+
+    A live run dropped a cafe whose parent `place:neighborhood` was never
+    settled. The player then could not walk to it, and two turns later the
+    resolver had put a barista in their kitchen rather than contradict itself.
+    Keeping the cafe and deciding it sits in the city is the smaller invention.
+    """
+    with_orphan = reply(
+        player_location="place:kitchen",
+        new_entities=[["place:orphan", "place", "Nowhere", "place:never-made"]],
+    )
+    llm = FakeLLM(
+        config, call_log,
+        {"resolver": [SPAWN, with_orphan], "narrator": ["Quiet.", "The fryer ticks."]},
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+
+    result = turn.play("I wait", life)
+
+    assert store.entity("place:orphan").location_id == "place:spawn-city"
+    assert any("place:orphan" in item and "instead" in item for item in result.dropped)
+    assert result.narration == "The fryer ticks."
+
+
+# ---- the ledger arrives too late to retry, so it takes both forms ----
+
+
+def test_the_ledger_takes_arrays_the_way_everything_else_does(store, config, call_log):
+    """A live run lost a move and a supersession to the dict-only shapes.
+
+    The ledger commits after the turn is narrated, so it cannot be retried: a
+    format slip there costs real money and a real location.
+    """
+    from worldsim.resolve import Delta, Learned, Move, Supersede
+
+    assert Move.model_validate(["person:you", "place:bedroom"]).location_id == "place:bedroom"
+    assert Delta.model_validate(["person:you", "cash_usd", -40]).delta == -40
+    assert Learned.model_validate(
+        ["person:gary", "person:you", "debt", "watched you count it"]
+    ).how == "watched you count it"
+    # And a supersession without the two tags defaults them rather than dying.
+    plain = Supersede.model_validate(
+        {"entity_id": "person:you", "key": "wearing", "value": "a clean shirt"}
+    )
+    assert (plain.source, plain.visibility) == ("invented", "obvious")

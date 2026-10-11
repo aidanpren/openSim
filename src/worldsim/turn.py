@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .llm import LedgerFailed
-from .render import BIOGRAPHY, Narrator
+from .render import BIOGRAPHY, Narrator, sentences_in as _sentences_in
 from .resolve import (
     PLAYER_ID,
     SPAWN_PLACE_ID,
@@ -26,8 +26,14 @@ from .resolve import (
     Resolver,
     Scene,
     draw_station,
+    not_a_fact,
 )
 from .store import Fact, FactConflict, Life, Store, StoreError
+
+
+# Spec 4: two to four sentences, for the whole turn. A turn can reach the player
+# in two beats, and two beats of "two to four" made six-sentence turns live.
+SENTENCES_A_TURN = 4
 
 
 @dataclass
@@ -58,6 +64,8 @@ class _Committed:
     scene: Scene | None = None
     beats: list[str] = field(default_factory=list)
     noticed: list[int] = field(default_factory=list)
+    # What the player was told at the end of the previous turn.
+    said_before: str | None = None
 
     @property
     def narration(self) -> str:
@@ -108,15 +116,21 @@ class Turn:
         `on_text` receives each narrated sentence as it clears, so speech can
         begin before the sentence after it has been written.
         """
-        recent = [
-            f"{row['player_said']} -> {row['narration']}"
-            for row in self.store.recent_turns(life.id, limit=6)
-        ]
+        rows = self.store.recent_turns(life.id, limit=6)
+        recent = [f"{row['player_said']} -> {row['narration']}" for row in rows]
+        # Six of ten turns in a live run re-described the same kitchen window,
+        # because the narrator had no idea what it had already said. It knows
+        # what it said inside a turn; this gives it the turn before.
+        last_said = rows[-1]["narration"] if rows else None
         dropped: list[str] = []
-        committed = _Committed()
+        committed = _Committed(said_before=last_said)
 
+        # The narrator never sees this; it is the audit trail on every fact the
+        # turn writes, so the player's own words are the better fallback.
         def on_object(index: int, obj) -> None:
             if index == 0:
+                if not obj.intent:
+                    obj.intent = player_said[:80]
                 self._commit_opening(obj, committed, dropped, on_text)
             elif index == 1:
                 self._commit_scene(obj, committed, dropped, on_text)
@@ -243,9 +257,12 @@ class Turn:
         committed.noticed += noticed
         if committed.opening.uncertain:
             return  # the outcome decides this beat, and it has not been rolled
-        # Nothing new to say means no second call. A turn that only moved the
-        # player through a door is one beat, not two.
-        if noticed or scene.dialogue or scene.you_said_aloud:
+        # A second beat has to be a genuinely different thing to say: someone
+        # spoke, or someone is there who was not accounted for. More facts
+        # about the same room are not — the first beat already described it,
+        # and a live turn answered "what's in this kitchen?" by narrating the
+        # kitchen twice, word for word, because new facts alone let this fire.
+        if scene.dialogue or scene.you_said_aloud or self._new_faces(scene):
             self._narrate(
                 committed,
                 committed.opening.intent,
@@ -254,6 +271,14 @@ class Turn:
                 on_text,
                 only_new=noticed,
             )
+
+    def _new_faces(self, scene: Scene) -> bool:
+        """Whether the scene brought a person into the room with the player."""
+        player = self.store.entity(PLAYER_ID)
+        here = player.location_id if player else None
+        return any(
+            e.kind == "person" and e.location_id == here for e in scene.new_entities
+        )
 
     def _narrate(
         self,
@@ -264,12 +289,21 @@ class Turn:
         on_text: Callable[[str], None] | None,
         only_new: list[int] | None = None,
     ) -> None:
+        spent = sum(len(_sentences_in(beat)) for beat in committed.beats)
+        if committed.beats and spent >= SENTENCES_A_TURN:
+            # The turn has already said its four. A beat with no allowance left
+            # would be a model call that cannot be spoken, so it is not made —
+            # the facts behind it are committed either way, and the next turn
+            # has them.
+            return
         beat = self.narrator.narrate(
             intent,
             dialogue,
             only_new if only_new is not None else committed.noticed,
             said_aloud,
             already_said=committed.narration or None,
+            recently_said=committed.said_before,
+            max_sentences=max(SENTENCES_A_TURN - spent, 1),
             on_text=on_text,
         )
         committed.beats.append(beat)
@@ -310,7 +344,7 @@ class Turn:
 
         Models list a room before the building that holds it often enough that
         a single pass drops half a nested place. Keep passing while progress is
-        being made, then drop whatever still has nowhere to live.
+        being made, then deal with whatever still has nowhere to live.
         """
         pending = [e for e in new_entities if self.store.entity(e.id) is None]
         while pending:
@@ -330,17 +364,63 @@ class Turn:
                     dropped.append(f"entity {proposed.id}: {exc}")
             if len(waiting) == len(pending):
                 for proposed in waiting:
-                    dropped.append(
-                        f"entity {proposed.id}: no such location "
-                        f"{proposed.location_id!r}"
-                    )
+                    self._reparent(proposed, dropped)
                 return
             pending = waiting
+
+    def _reparent(self, proposed, dropped: list[str]) -> None:
+        """Hang an entity whose parent never materialised off the city instead.
+
+        Models keep inventing a container they never settle — `place:downtown`,
+        `place:neighborhood`, `place:apartment-building-garage`. Dropping the
+        entity looked tidy and played badly: a café that failed to exist meant
+        the player could not walk to it, and two turns later the resolver had
+        put a barista in their kitchen rather than contradict itself.
+
+        Keeping the café and deciding it sits in the city is the smaller
+        invention. The model proposed that the place exists, which is the part
+        that matters; code only picks the most plausible container when the one
+        it named was never real (spec 2.2).
+        """
+        outermost = SPAWN_PLACE_ID
+        walked = self.store.entity(PLAYER_ID)
+        seen: set[str] = set()
+        while walked is not None and walked.id not in seen:
+            seen.add(walked.id)
+            if walked.location_id is None:
+                outermost = walked.id
+                break
+            walked = self.store.entity(walked.location_id)
+
+        if self.store.entity(outermost) is None:
+            dropped.append(
+                f"entity {proposed.id}: no such location "
+                f"{proposed.location_id!r}, and nowhere to put it instead"
+            )
+            return
+        try:
+            self.store.add_entity(
+                proposed.id, proposed.kind, proposed.name, outermost
+            )
+        except StoreError as exc:
+            dropped.append(f"entity {proposed.id}: {exc}")
+            return
+        dropped.append(
+            f"entity {proposed.id}: {proposed.location_id!r} was never settled, "
+            f"so it was placed in {outermost} instead"
+        )
 
     def _facts(self, new_facts, cause: str, dropped: list[str]) -> list[Fact]:
         """Commit proposed facts. Returns the ones that actually landed."""
         landed = []
         for proposed in new_facts:
+            refusal = not_a_fact(proposed.key)
+            if refusal is not None:
+                # Dropped rather than retried: this arrives in the opening, and
+                # the player should not wait three seconds for a key the world
+                # is better off without.
+                dropped.append(f"fact {proposed.entity_id}.{proposed.key}: {refusal}")
+                continue
             try:
                 landed.append(
                     self.store.add_fact(

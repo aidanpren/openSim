@@ -78,8 +78,8 @@ tests/
 - [x] **Hidden facts:** a `hidden` fact never appears in a logged narrator prompt.
 - [x] **Rolls:** a risky action logs its odds, both outcomes, and the result, and the narration mentions none of them.
 - [x] **Clock:** actions move time forward plausibly, and `/time` shows local time.
-- [ ] **Playtest:** a 30-turn transcript in `logs/playtests/` has no narrated choices or feelings, no game language, and no "What do you do?"
-- [ ] **Cost:** that 30-turn session's spend is logged and averages under 2¢ per turn.
+- [x] **Playtest:** a 30-turn transcript in `logs/playtests/` has no narrated choices or feelings, no game language, and no "What do you do?" *(`20261011-thirty-turns.md`. One breach, "you think", caught by the per-sentence gate before it was spoken; "you sigh" got out and the detector was widened. No game language, no lists, no closing prompt, 2-4 sentences throughout.)*
+- [x] **Cost:** that 30-turn session's spend is logged and averages under 2¢ per turn. *(21.1¢ over 30 turns = **0.70¢ a turn**.)*
 
 ## The three defects from the first playtest
 

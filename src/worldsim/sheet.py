@@ -8,7 +8,9 @@ Created by __main__.py and called by the /sheet command.
 
 from __future__ import annotations
 
-from .resolve import PLAYER_ID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .resolve import PLAYER_ID, SPAWN_PLACE_ID
 from .store import Store
 
 # Known keys, grouped. Anything the world settles under another key still shows,
@@ -109,3 +111,72 @@ def _show(value: str | float) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+def timezone_here(store: Store) -> str | None:
+    """The IANA zone of wherever the character is standing, or None.
+
+    Spec 6.1 shows the clock in local time where the character is, so a drive to
+    Denver has to change the hour. The zone is settled on whichever place holds
+    it — a city, usually, not a kitchen — so this walks outward through the
+    containment chain and falls back to the spawn city for a place the model
+    left unparented. `seen` guards against a containment cycle, which the store
+    permits: it only refuses an entity inside itself.
+    """
+    entity = store.entity(PLAYER_ID)
+    seen: set[str] = set()
+    while entity is not None and entity.id not in seen:
+        seen.add(entity.id)
+        fact = store.live_fact(entity.id, "timezone")
+        if fact is not None:
+            return str(fact.value)
+        entity = store.entity(entity.location_id) if entity.location_id else None
+    fallback = store.live_fact(SPAWN_PLACE_ID, "timezone")
+    return str(fallback.value) if fallback else None
+
+
+def local_time(store: Store) -> str:
+    """The clock in the local time of wherever the character is (spec 6.1)."""
+    now = store.now()
+    zone = timezone_here(store)
+    if zone:
+        try:
+            return now.astimezone(ZoneInfo(zone)).strftime(
+                "%A, %B %-d, %Y, %-I:%M %p "
+            ) + zone
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return now.strftime("%A, %B %-d, %Y, %-I:%M %p UTC")
+
+
+def time_of_day(store: Store) -> str:
+    """The hour in plain words, for the narrator (spec 6.1).
+
+    The narrator was never told what time it was, so it invented one: a live
+    spawn opened on "the morning light spills gold" at 1:31 in the afternoon.
+    Telling the model to convert UTC itself did not hold — it is arithmetic,
+    and code already knows the answer.
+    """
+    zone = timezone_here(store)
+    now = store.now()
+    if zone:
+        try:
+            now = now.astimezone(ZoneInfo(zone))
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    hour = now.hour
+    if hour < 5:
+        part = "the small hours"
+    elif hour < 8:
+        part = "early morning"
+    elif hour < 12:
+        part = "morning"
+    elif hour < 14:
+        part = "the middle of the day"
+    elif hour < 18:
+        part = "afternoon"
+    elif hour < 21:
+        part = "evening"
+    else:
+        part = "night"
+    return f"{now.strftime('%A')} {part}, {now.strftime('%-I:%M %p').lower()}"

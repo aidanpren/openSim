@@ -287,9 +287,11 @@ def test_nested_places_land_even_when_listed_child_first(store, config, call_log
     assert store.entity("place:tavern") is not None
     assert store.entity("place:back-room").location_id == "place:tavern"
     assert store.entity("person:you").location_id == "place:back-room"
-    # The one with no possible parent is reported, not crashed on.
-    assert store.entity("place:orphan") is None
-    assert any("place:orphan" in item for item in result.dropped)
+    # The one whose parent was never settled is kept and reparented to the
+    # city, not dropped: dropping it made the place unreachable, and the world
+    # then contradicted itself rather than admit the place did not exist.
+    assert store.entity("place:orphan").location_id == "place:spawn-city"
+    assert any("place:orphan" in item and "instead" in item for item in result.dropped)
 
 
 def test_a_turn_is_logged_for_resuming(store, config, call_log):
@@ -497,3 +499,52 @@ def test_the_extremes_are_edge_cases_not_the_standard():
 def test_the_weights_are_a_distribution():
     assert sum(weight for weight, _ in STATIONS) == 100
     assert all(weight > 0 for weight, _ in STATIONS)
+
+
+# ---- transient state is not a fact (playtest-20261011, top finding) ----
+
+
+def test_state_that_changes_every_turn_is_refused(store, config, call_log):
+    """Facts are permanent (rule 3), so momentary state has no business being one.
+
+    A live run settled `posture = "sitting on a bench"` on the player. A later
+    turn proposing a new value was refused as a duplicate rather than treated
+    as a change, so it still said that after they had walked home — and nothing
+    could correct it.
+    """
+    stateful = reply(
+        intent="walk home",
+        player_location="place:spawn-city",
+        summary="you walk",
+        new_facts=[
+            ["person:you", "posture", "sitting on a bench"],
+            ["person:you", "activity", "eating pickles from the jar"],
+            ["person:you", "location", "place:kitchen"],
+            ["place:bar", "occupants", "person:you"],
+            # Lasting condition is still a fact.
+            ["person:you", "condition", "a broken wrist, splinted"],
+        ],
+    )
+    llm, resolver, narrator, turn = build(
+        store, config, call_log, [SPAWN, stateful], ["Quiet.", "The street is empty."]
+    )
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+
+    result = turn.play("I walk home", life)
+
+    for refused in ("posture", "activity", "location"):
+        assert store.live_fact(PLAYER_ID, refused) is None
+        assert any(refused in item for item in result.dropped)
+    assert store.live_fact("place:bar", "occupants") is None
+    # And the durable one landed.
+    assert store.live_fact(PLAYER_ID, "condition").value == "a broken wrist, splinted"
+
+
+def test_where_something_is_stays_the_store_s_job():
+    from worldsim.resolve import not_a_fact
+
+    assert not_a_fact("location") and "location" in not_a_fact("location")
+    assert not_a_fact("posture") and "permanent" in not_a_fact("posture")
+    # The sheet's own keys are untouched.
+    for keeper in ("name", "job", "condition", "wearing", "carrying", "cash_usd"):
+        assert not_a_fact(keeper) is None, keeper

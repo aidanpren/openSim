@@ -93,12 +93,17 @@ notice, so on a fact about them it decides whether they know it themselves:
   deliberately, and never for something they would obviously know about
   themselves.
 
-## The city
+## The city and the hour
 
 Write a `timezone` fact on the city entity you were given, as an IANA zone name
 like `America/Chicago`, with `"source": "world-knowledge"`. The clock is stored
 in UTC and shown to the player in local time, so without this they are told the
 wrong hour.
+
+`utc_time` is **UTC**, not local. Convert it to the city's own zone before you
+decide what time of day it is: Kansas City in October is UTC-5, so 18:24 UTC is
+1:24 in the afternoon, not the evening. Getting this wrong opens the world on
+the wrong half of the day and every hour you schedule inherits the error.
 
 ## Numbers
 
@@ -119,7 +124,7 @@ stranger across the room does not.
 - Ordinary over dramatic. Most lives are not thrillers, and most are not
   tragedies either.
 - Entity ids are stable and lowercase, shaped `kind:name`.
-- Set the time of day consistently with the clock you are given.
+- Set the time of day consistently with the clock you are given, after converting it to local.
 
 ## Output
 

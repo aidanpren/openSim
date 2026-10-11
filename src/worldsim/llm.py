@@ -113,6 +113,12 @@ RETRY_PREAMBLE = (
     "Reply again with only valid JSON matching the required shape. No prose."
 )
 
+# A validation error can run to hundreds of tokens of pydantic URLs, and the
+# retry appends it to a prompt that was already budgeted. Cap it, and have the
+# caller hold back this much room (spec 5.2).
+MAX_ERROR_CHARS = 600
+RETRY_ROOM = (len(RETRY_PREAMBLE) + MAX_ERROR_CHARS) // 4 + 1
+
 
 @dataclass
 class _Streamed:
@@ -312,7 +318,9 @@ class _BaseLLM:
         error: Exception | str = "the reply contained no complete JSON object"
         for attempt in (1, 2):
             if attempt == 2:
-                user = user + "\n\n" + RETRY_PREAMBLE.format(error=str(error))
+                user = user + "\n\n" + RETRY_PREAMBLE.format(
+                    error=str(error)[:MAX_ERROR_CHARS]
+                )
             model = self.config.model_for(role)
             streamed = _Streamed()
 
@@ -419,7 +427,13 @@ class _BaseLLM:
                     exc, role, model, started, 1, transport_try
                 )
                 continue
+            # A gated narration that stopped early never reaches the provider's
+            # usage chunk, so the call would log zero tokens and vanish from the
+            # session spend (rule 9). The text is in hand either way, so count
+            # it the way the rest of the engine counts: four characters a token.
             usage = self._stream_usage
+            if usage == (0, 0):
+                usage = (len(system + user) // 4, len(text) // 4)
             price = self.config.price_for(model)
             self.call_log.write(
                 CallRecord(
@@ -463,7 +477,9 @@ class _BaseLLM:
         try:
             return parse(raw)
         except (ValidationError, ValueError) as first:
-            retry_user = user + "\n\n" + RETRY_PREAMBLE.format(error=str(first))
+            retry_user = user + "\n\n" + RETRY_PREAMBLE.format(
+                error=str(first)[:MAX_ERROR_CHARS]
+            )
             raw = self._call(role, system, retry_user, attempt=2)
             try:
                 return parse(raw)

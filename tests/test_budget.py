@@ -68,7 +68,10 @@ def test_a_long_game_does_not_grow_either_prompt(store, config, call_log):
     ]
     llm = FakeLLM(
         config, call_log,
-        {"resolver": script, "narrator": ["Quiet."] + [f"Line {n}." for n in range(turns)]},
+        # Two narrator lines per turn: a beat can be regenerated when every
+        # sentence of it repeats what the player was already told.
+        {"resolver": script,
+         "narrator": ["Quiet."] + [f"Line {n}." for n in range(turns * 3)]},
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)

@@ -13,7 +13,7 @@ import random
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Callable
 
 from .config import ConfigError, load_config
 from .llm import (
@@ -26,24 +26,52 @@ from .llm import (
 )
 from .render import Narrator
 from .resolve import PLAYER_ID, SPAWN_PLACE_ID, Resolver
-from .sheet import character_sheet
+from .sheet import character_sheet, local_time
 from .store import Store, StoreError
 from .turn import Turn, TurnResult, begin_life
+from .voice import Voice
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 COULD_NOT_RESOLVE = "Sorry, that didn't come through. Say it again?"
 
+# How long the prompt will wait on the voice before deciding it is wedged, in
+# 0.2s polls. Short polls rather than one long block so Ctrl-C lands promptly.
+VOICE_PATIENCE = 450
 
-def speak(sentence: str) -> None:
+
+def make_speak(voice: Voice) -> Callable[[str], None]:
     """Deliver one sentence the moment it clears the contract.
 
-    In text this only means it appears a beat earlier. It is here because it is
-    the seam voice needs: streaming text-to-speech takes a clause at a time, so
-    the first sentence can be spoken while the rest is still being written.
+    Both at once, on purpose: the screen keeps the transcript that playtests are
+    reviewed against, and the speakers get the sentence while the one after it
+    is still being written. `Voice.say` only enqueues, so the model stream never
+    waits for the synthesizer.
     """
-    print(sentence, end=" ", flush=True)
+
+    def speak(sentence: str) -> None:
+        print(sentence, end=" ", flush=True)
+        voice.say(sentence)
+
+    return speak
+
+
+def wait_for_quiet(voice: Voice) -> None:
+    """Hold the prompt until the narration has finished being spoken.
+
+    This is turn-taking, not politeness: a prompt that appears over the voice
+    invites the player to talk across the world. Ctrl-C cuts the rest short.
+    """
+    try:
+        for _ in range(VOICE_PATIENCE):
+            if voice.wait(timeout=0.2):
+                return
+    except KeyboardInterrupt:
+        print()
+    # Barge-in, or a synthesizer that stopped answering. Either way the player
+    # gets the prompt back.
+    voice.silence()
 
 
 def latest_world(saves_dir: Path) -> Path | None:
@@ -56,42 +84,6 @@ def latest_world(saves_dir: Path) -> Path | None:
     return max(worlds, key=lambda p: (p / "world.db").stat().st_mtime)
 
 
-def timezone_here(store: Store) -> str | None:
-    """The IANA zone of wherever the character is standing, or None.
-
-    Spec 6.1 shows the clock in local time where the character is, so a drive to
-    Denver has to change the hour. The zone is settled on whichever place holds
-    it — a city, usually, not a kitchen — so this walks outward through the
-    containment chain and falls back to the spawn city for a place the model
-    left unparented. `seen` guards against a containment cycle, which the store
-    permits: it only refuses an entity inside itself.
-    """
-    entity = store.entity(PLAYER_ID)
-    seen: set[str] = set()
-    while entity is not None and entity.id not in seen:
-        seen.add(entity.id)
-        fact = store.live_fact(entity.id, "timezone")
-        if fact is not None:
-            return str(fact.value)
-        entity = store.entity(entity.location_id) if entity.location_id else None
-    fallback = store.live_fact(SPAWN_PLACE_ID, "timezone")
-    return str(fallback.value) if fallback else None
-
-
-def local_time(store: Store) -> str:
-    """The clock in the local time of wherever the character is (spec 6.1)."""
-    now = store.now()
-    zone = timezone_here(store)
-    if zone:
-        try:
-            return now.astimezone(ZoneInfo(zone)).strftime(
-                "%A, %B %-d, %Y, %-I:%M %p "
-            ) + zone
-        except (ZoneInfoNotFoundError, ValueError):
-            pass
-    return now.strftime("%A, %B %-d, %Y, %-I:%M %p UTC")
-
-
 def log_failure(config, player_said: str, exc: Exception) -> None:
     """Why a turn was refused, so a refusal can be diagnosed later."""
     path = config.logs_dir / "failures.log"
@@ -100,9 +92,20 @@ def log_failure(config, player_said: str, exc: Exception) -> None:
         f.write(f"{datetime.now(timezone.utc).isoformat()}\t{player_said}\t{exc}\n")
 
 
-def dev_view(store: Store, resolver: Resolver, result: TurnResult | None, call_log: CallLog) -> str:
+def dev_view(
+    store: Store,
+    resolver: Resolver,
+    result: TurnResult | None,
+    call_log: CallLog,
+    voice: Voice | None = None,
+) -> str:
     """Hidden during normal play (spec 13.5)."""
     lines = ["", "--- dev ---", f"world time: {store.now().isoformat()}"]
+    if voice is not None and voice.failures:
+        # The voice falls silent rather than losing a turn, which means a broken
+        # synthesizer is otherwise indistinguishable from a quiet room.
+        lines.append(f"voice: {len(voice.failures)} failures")
+        lines.extend(f"  {item}" for item in voice.failures[-3:])
     if result:
         lines.append(f"intent: {result.intent}  ({result.duration_minutes} min)")
         if result.roll:
@@ -167,16 +170,24 @@ def main() -> int:
     # at and then every roll in it (rule 6).
     rng = random.Random()
     turn = Turn(store, resolver, narrator, rng)
+    voice = Voice(
+        enabled=config.voice_enabled,
+        voice=config.voice_name,
+        rate=config.voice_rate,
+    )
+    speak = make_speak(voice)
 
     life = store.current_life()
     if life is None:
         print(f"A new life in {config.spawn_city}.\n")
+        voice.warm()
         try:
             life, opening = begin_life(
                 store, resolver, narrator, config.spawn_city, rng, on_text=speak
             )
         except (ModelCallFailed, StoreError) as exc:
             print(f"The world could not be started: {exc}", file=sys.stderr)
+            voice.close()
             store.close()
             return 1
         print()
@@ -191,6 +202,7 @@ def main() -> int:
     print()
 
     while True:
+        wait_for_quiet(voice)
         try:
             said = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -219,6 +231,10 @@ def main() -> int:
             else:
                 print(f"\nNo such command. Try /sheet, /time, /cost, /dev, /quit.\n")
             continue
+
+        # The voice loads while the resolver thinks, so the first sentence is
+        # spoken 0.58s after it clears rather than 1.35s.
+        voice.warm()
 
         try:
             last = turn.play(said, life, on_text=speak)
@@ -261,13 +277,15 @@ def main() -> int:
         print()  # the narration already went out, sentence by sentence
 
         if dev:
-            print(dev_view(store, resolver, last, call_log))
+            print(dev_view(store, resolver, last, call_log, voice))
 
         if last.ends_life:
             store.end_life(life.id, last.summary)
             print("\nThat life is over.\n")
             break
 
+    wait_for_quiet(voice)
+    voice.close()
     print(f"Saved to {world_dir}. {call_log.total_cents():.2f} cents this session.")
     store.close()
     return 0

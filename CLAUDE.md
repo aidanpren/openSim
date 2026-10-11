@@ -19,9 +19,15 @@ Vision: @docs/vision.md
 This Mac cannot run uv. The installer works, but macOS refuses to exec the
 binary (exit 126), and even a copied `/bin/echo` is killed (exit 137) — an
 endpoint policy, with Jamf tooling in `/usr/local/bin`. Python extension
-modules load fine; only standalone executables are blocked. The Xcode license
+modules load fine; only standalone executables are blocked. Apple-signed system
+binaries are fine too — `/usr/bin/say` runs, which is what voice uses; it is
+*broken* signatures, like a copied binary, that get killed. The Xcode license
 has also not been accepted, which is what breaks `/usr/bin/python3`, `pip3`,
 and `git`.
+
+The license also blocks any package that builds from source, because `xcrun`
+exits 69. That rules out `pyobjc` on this Python, so no in-process speech
+synthesizer or on-device speech recognition here (see `docs/milestones/07-voice.md`).
 
 So the venv is built from Xcode's bundled Python 3.9.6 at
 `/Applications/Xcode.app/Contents/Developer/usr/bin/python3`, and 3.9 needs

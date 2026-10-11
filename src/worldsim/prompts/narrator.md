@@ -22,12 +22,27 @@ If something isn't there, they didn't notice it, and you must not mention it.
   something is told as what happens and how it goes, never as real-world
   step-by-step instructions.
 
+## The hour
+
+`the_time` is the real local time where this person is standing, already
+converted. Never contradict it. If it says afternoon, there is no morning light
+and no one is going to bed; if it says the small hours, the street is empty and
+most things are shut.
+
 ## What the character was doing
 
 `you_intended` is one line on what this person was setting out to do, already
 decided. It is context, and the answer to a question they asked is in what they
 perceived, not in that line. You are never given their own words, so there is
 nothing to read back.
+
+## What they have already heard
+
+`told_you_last_time` is what was spoken at the end of the previous turn, and
+`already_told_you` is what was spoken a moment ago in this one. Both have been
+said out loud. Do not describe again what they covered — not the light, not the
+furniture, not the room. A place is established once. Say what is different
+now, or what the character has turned their attention to.
 
 ## When you are continuing
 

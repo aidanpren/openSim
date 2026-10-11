@@ -389,20 +389,25 @@ def _objects(reply_text: str) -> list[str]:
 # ---- the instructions are most of the input, so they get a ceiling ----
 
 
-def test_the_resolver_instructions_stay_small():
-    """Input p50 was 2512 tokens and resolver.md was 1895 of them.
+def test_the_instructions_stay_small():
+    """The system prompt is most of what a call has to prefill, every turn.
 
-    The system prompt is the overwhelming majority of what the resolver has to
-    prefill, every single turn, and prompts only ever grow. Documenting the
-    third object pushed this to 2204 before it was compressed back down; the
-    ceiling is here so the next addition has to pay for itself.
+    The ceiling was first set at 1900 on the theory that prefill was what the
+    player waited on. The 30-turn run measured the resolver's first token at
+    0.8s against a 2,800-token input, so that theory was wrong: generation of
+    the first object is the wait, and input tokens are nearly free in latency
+    terms. The limits stay anyway, for the two reasons that survive — input is
+    billed on every single turn, and a prompt that grows without bound dilutes
+    the instructions that matter. They are a budget to spend deliberately, not
+    a line that must never move: raising one is a decision, and it belongs in
+    the same commit as the thing that earned it.
     """
     sizes = {
         path.name: estimate_tokens(path.read_text())
         for path in PROMPTS_DIR.glob("*.md")
     }
-    assert sizes["resolver.md"] < 1900, sizes
-    assert sizes["narrator.md"] < 900, sizes
+    assert sizes["resolver.md"] < 2000, sizes
+    assert sizes["narrator.md"] < 1050, sizes
     assert sizes["spawn.md"] < 1700, sizes
     # The opening narration is a one-off at spawn, so it can afford to be long,
     # but nothing should quietly become the biggest file.
@@ -416,3 +421,199 @@ def test_a_context_is_sent_compactly():
     payload = {"a": [1, 2], "b": {"c": "d"}}
     assert as_prompt(payload) == '{"a":[1,2],"b":{"c":"d"}}'
     assert "\n" not in as_prompt(payload)
+
+
+# ---- the second beat must not say the first beat's lines again ----
+
+
+def test_a_repeated_sentence_never_reaches_the_player(store, config, call_log):
+    """`already_told_you` asks; this enforces.
+
+    A live turn answered "what's in this kitchen?" by narrating the kitchen
+    twice, word for word: the model had the first beat in its prompt and
+    repeated it anyway. Streaming means a sentence cannot be taken back once
+    spoken, so the check happens before it goes out.
+    """
+    with_gary = (
+        json.dumps(
+            {
+                "intent": "walk into the tavern",
+                "duration_minutes": 11,
+                "player_location": "place:tavern",
+                "new_entities": [["place:tavern", "place", "The Double Luck", "place:spawn-city"]],
+                "new_facts": [["place:tavern", "smell", "stale beer"]],
+            }
+        )
+        + json.dumps(
+            {
+                "summary": "Gary is behind the bar",
+                "new_entities": [["person:gary", "person", "Gary", "place:tavern"]],
+                "dialogue": [{"speaker_id": "person:gary", "gist": "what'll it be"}],
+            }
+        )
+        + json.dumps({})
+    )
+    llm = FakeLLM(
+        config, call_log,
+        {
+            "resolver": [SPAWN, with_gary],
+            "narrator": [
+                "Oil ticks.",
+                "Stale beer and fryer oil. The television is on with the sound off.",
+                # The second beat repeats the first and adds one new line.
+                "Stale beer and fryer oil. Gary looks up from the counter.",
+            ],
+        },
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+    spoken: list[str] = []
+
+    result = turn.play("I walk into the tavern", life, on_text=spoken.append)
+
+    assert spoken.count("Stale beer and fryer oil.") == 1, spoken
+    assert "Gary looks up from the counter." in spoken
+    assert result.narration.count("Stale beer and fryer oil.") == 1
+
+
+def test_more_facts_about_the_same_room_do_not_earn_a_second_beat(store, config, call_log):
+    """Only speech or a new face does. The room was already described."""
+    more_kitchen = (
+        json.dumps(
+            {
+                "intent": "look around properly",
+                "duration_minutes": 1,
+                "player_location": "place:kitchen",
+                "new_facts": [["place:kitchen", "counters", "clean laminate"]],
+            }
+        )
+        + json.dumps(
+            {
+                "summary": "you take the room in",
+                "new_facts": [["place:kitchen", "cabinets", "wooden, above and below"]],
+            }
+        )
+        + json.dumps({})
+    )
+    llm, resolver, narrator, turn = build(
+        store, config, call_log, [SPAWN, more_kitchen],
+        ["Oil ticks.", "Clean laminate, and wooden cabinets above the sink."],
+    )
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+
+    turn.play("What's in this kitchen?", life)
+
+    prompts = [u for role, _, u in llm.prompts if role == "narrator"]
+    assert len(prompts) == 2, "the kitchen was described once, not twice"
+    # The scene's fact still landed and is still perceived; it just waits for
+    # the next thing that is worth saying out loud.
+    assert store.live_fact("place:kitchen", "cabinets") is not None
+
+
+def test_normalising_catches_a_repeat_that_is_not_byte_identical():
+    from worldsim.render import _normalise, _sentences
+
+    assert _normalise("Stale beer, and fryer oil!") == _normalise("stale beer and fryer oil")
+    assert _sentences("One thing. Two things.") == frozenset({"one thing", "two things"})
+    assert _sentences(None) == frozenset()
+
+
+def test_a_turn_never_runs_past_four_sentences(store, config, call_log):
+    """Spec 4's limit is for the whole turn, not for each beat.
+
+    Two beats of "two to four sentences" made six-sentence turns in a live run.
+    The allowance is spent across the beats, and the gate stops the second one
+    when it runs out.
+    """
+    with_gary = (
+        json.dumps(
+            {
+                "intent": "walk into the tavern",
+                "duration_minutes": 11,
+                "player_location": "place:tavern",
+                "new_entities": [["place:tavern", "place", "The Double Luck", "place:spawn-city"]],
+                "new_facts": [["place:tavern", "smell", "stale beer"]],
+            }
+        )
+        + json.dumps(
+            {
+                "summary": "Gary is behind the bar",
+                "new_entities": [["person:gary", "person", "Gary", "place:tavern"]],
+                "dialogue": [{"speaker_id": "person:gary", "gist": "what'll it be"}],
+            }
+        )
+        + json.dumps({})
+    )
+    llm = FakeLLM(
+        config, call_log,
+        {
+            "resolver": [SPAWN, with_gary],
+            "narrator": [
+                "Oil ticks.",
+                "Stale beer. The lights are low. A television mutters. Someone laughs.",
+                "Gary looks up. He sets down the rag. He waits. The rail is three deep.",
+            ],
+        },
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+    spoken: list[str] = []
+
+    result = turn.play("I walk in", life, on_text=spoken.append)
+
+    from worldsim.render import sentences_in
+
+    assert len(sentences_in(result.narration)) <= 4, result.narration
+    assert len(spoken) <= 4, spoken
+    # The first beat spent the whole allowance, so the second was never called.
+    assert spoken[0] == "Stale beer."
+    assert [u for role, _, u in llm.prompts if role == "narrator"].__len__() == 2
+
+
+def test_dedup_never_silences_a_turn(store, config, call_log):
+    """Silence is worse than a repeat.
+
+    A live turn asking "how much money have I got left?" came back completely
+    blank: the narrator restated the previous turn and the duplicate filter ate
+    every sentence of it.
+    """
+    nothing_new = reply(player_location="place:kitchen", summary="you check")
+    llm = FakeLLM(
+        config, call_log,
+        {
+            "resolver": [SPAWN, nothing_new],
+            # The turn, and then the regeneration, are both word for word the
+            # narration before them. Only then does the repeat go out.
+            "narrator": [
+                "The fryer is still ticking.",
+                "The fryer is still ticking.",
+                "The fryer is still ticking.",
+            ],
+        },
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+    spoken: list[str] = []
+
+    result = turn.play("How much money have I got left?", life, on_text=spoken.append)
+
+    assert result.narration == "The fryer is still ticking."
+    assert spoken == ["The fryer is still ticking."]
+
+
+def test_a_null_list_is_read_as_an_empty_one(store, config, call_log):
+    """`"dialogue": null` took a whole scene and its ledger down live."""
+    from worldsim.resolve import Ledger, Opening, Scene
+
+    assert Scene.model_validate_json('{"summary":"x","dialogue":null}').dialogue == []
+    assert Ledger.model_validate_json('{"deltas":null,"moves":null}').deltas == []
+    nulled = Opening.model_validate_json(
+        '{"intent":"x","duration_minutes":1,"player_location":"p","new_facts":null}'
+    )
+    assert nulled.new_facts == []

@@ -28,6 +28,13 @@ CHARS_PER_TOKEN = 4
 COMPACT = (",", ":")
 
 
+# Four characters to a token, floored twice: the instructions and the context are
+# measured separately but sent concatenated, so their two floors can lose a
+# token against the single floor of the whole prompt. One token of margin makes
+# the bound hold rather than miss by one.
+SEAM = 1
+
+
 def as_prompt(value: object) -> str:
     """A context as it is sent. The one place that decides the wire form."""
     return json.dumps(value, separators=COMPACT, default=str)
