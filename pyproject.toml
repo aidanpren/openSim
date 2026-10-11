@@ -6,10 +6,23 @@ requires-python = ">=3.12"
 dependencies = [
     "openai>=1.0",
     "python-dotenv>=1.0",
+    "pydantic>=2.0",
 ]
 
-# Step 0 only needs the freedom-test script to run, so nothing is built or
-# installed as a package yet. Milestone 1's project setup step adds the
-# src/worldsim layout, pydantic, and pytest.
-[tool.uv]
-package = false
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worldsim"]
+
+# src/ goes on the path here rather than installing the project, so the engine
+# can run on this machine's Python 3.9 without lying about requires-python.
+# Python 3.12 is the target; 3.9 also needs `pip install eval_type_backport`,
+# which pydantic uses to read `X | None` annotations. Drop it on 3.12.
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

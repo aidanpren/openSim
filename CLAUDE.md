@@ -9,16 +9,51 @@ Vision: @docs/vision.md
 
 ## Stack
 
-- Python 3.12, managed with uv
+- Python 3.12 is the target, managed with uv. **Neither is available on this
+  machine** — see "Dev environment here" below before running anything.
 - OpenRouter through the `openai` SDK (`base_url="https://openrouter.ai/api/v1"`)
 - SQLite (stdlib `sqlite3`), pydantic, pytest
 
+## Dev environment here
+
+This Mac cannot run uv. The installer works, but macOS refuses to exec the
+binary (exit 126), and even a copied `/bin/echo` is killed (exit 137) — an
+endpoint policy, with Jamf tooling in `/usr/local/bin`. Python extension
+modules load fine; only standalone executables are blocked. The Xcode license
+has also not been accepted, which is what breaks `/usr/bin/python3`, `pip3`,
+and `git`.
+
+So the venv is built from Xcode's bundled Python 3.9.6 at
+`/Applications/Xcode.app/Contents/Developer/usr/bin/python3`, and 3.9 needs
+`eval_type_backport` — pydantic 2 otherwise raises `TypeError` on `X | None`
+annotations at class-definition time, which would make the spec 3.1 resolver
+contract unwritable. Write code for 3.12 anyway: modern annotations are fine,
+but avoid `match`, `X | Y` in `isinstance`, and 3.10+ stdlib additions.
+
+`git` does not run here either. Commit through GitKraken, or accept the Xcode
+license to get the CLI back.
+
+To rebuild the environment from scratch:
+
+```
+/Applications/Xcode.app/Contents/Developer/usr/bin/python3 -m venv .venv
+./.venv/bin/pip install openai python-dotenv pydantic pytest eval_type_backport
+```
+
+`pip install -e .` does **not** work, because `pyproject.toml` honestly declares
+`requires-python = ">=3.12"`. `src/` reaches the interpreter through
+`PYTHONPATH` instead, and through pytest's `pythonpath` setting for tests.
+
 ## Commands
 
-- `uv sync`: install dependencies
-- `uv run python -m worldsim`: play (starts a new world or resumes the last one)
-- `uv run pytest`: run tests (offline, with `FakeLLM`)
-- `uv run python scripts/freedom_test.py`: run the model freedom test
+- `./.venv/bin/python -m pytest`: run tests (offline, with `FakeLLM`)
+- `PYTHONPATH=src ./.venv/bin/python -m worldsim`: play (new world, or resumes
+  the last one under `saves/`)
+- `./.venv/bin/python scripts/freedom_test.py`: run the model freedom test
+
+Once a real 3.12 is installed, these become `uv sync`, `uv run python -m
+worldsim`, `uv run pytest`, and `uv run python scripts/freedom_test.py`, and
+`eval_type_backport` can be dropped.
 
 ## Rules that don't bend
 

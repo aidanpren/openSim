@@ -74,9 +74,91 @@ tests/
 - [ ] **Revisit:** describe a bar, leave, and come back. It's the same bartender with the same details. Automated with `FakeLLM`, then confirmed in a playtest.
 - [ ] **Relaunch:** `/quit` mid-scene, relaunch, and continue from the same place, time, and sheet.
 - [ ] **Items:** pick something up and it's on the sheet; give it away and it's gone.
-- [ ] **Money:** a win or a purchase changes cash by exactly the delta.
-- [ ] **Hidden facts:** a `hidden` fact never appears in a logged narrator prompt.
-- [ ] **Rolls:** a risky action logs its odds, both outcomes, and the result, and the narration mentions none of them.
-- [ ] **Clock:** actions move time forward plausibly, and `/time` shows local time.
+- [x] **Money:** a win or a purchase changes cash by exactly the delta.
+- [x] **Hidden facts:** a `hidden` fact never appears in a logged narrator prompt.
+- [x] **Rolls:** a risky action logs its odds, both outcomes, and the result, and the narration mentions none of them.
+- [x] **Clock:** actions move time forward plausibly, and `/time` shows local time.
 - [ ] **Playtest:** a 30-turn transcript in `logs/playtests/` has no narrated choices or feelings, no game language, and no "What do you do?"
 - [ ] **Cost:** that 30-turn session's spend is logged and averages under 2¢ per turn.
+
+## The three defects from the first playtest
+
+Found in `logs/playtests/verify-run.md`, then worked on and re-measured in
+`runA-405b.md` (hermes-4-405b resolver) and `runB-70b.md` (hermes-3-70b
+resolver).
+
+1. **The resolver moves nobody. FIXED, confirmed live.**
+   `Outcome.player_location` is now required, so omitting it is a schema error
+   that spends the spec 3.3 retry. `Resolver.check` refuses a location that
+   neither exists nor is created in the same outcome, reaching that retry
+   through a new `check` callback on `llm.json`. `turn._commit` then moves the
+   player there whether or not a `moves` entry was given, so the truth cannot
+   disagree with the narration. Both runs walk into a bar that exists and keep
+   the same bartender, with consistent details, across three turns.
+2. **The narrator still narrates the player. PARTLY FIXED.**
+   `narrated_the_player` catches the phrasing and one regeneration fires, but
+   run B produced "You say you'll have a beer, please", regenerated, and got
+   the same breach back — which was then accepted silently. The cause was
+   `narrator.md` telling it to "report them only as far as the character would
+   register having spoken", which invites exactly that. That section is
+   rewritten with an explicit prohibition and a worked example, and a breach
+   surviving regeneration is now recorded on `Narrator.breaches`. Not yet
+   verified live.
+3. **The opening reads as a character sheet. FIXED, confirmed live.**
+   `opening.md` plus a biography filter on the opening context. Run A opened
+   with "The fluorescent light buzzes overhead... another notification you
+   can't afford to look at" — no name, age, job, or cash recited.
+
+## Two findings that change the plan
+
+**Latency is not about model size.** The resolver's p50 is 17.8 s on
+hermes-4-405b and **21.7 s** on hermes-3-llama-3.1-70b: the smaller, cheaper
+model is slower, on similar output (628 vs 518 tokens). Against the spec's
+4-second target the only levers left are shrinking the resolver's ~600 tokens
+of JSON per turn, or splitting the call. Swapping models will not do it. The
+70B did hold the JSON contract for four turns, so it remains viable on cost.
+
+## Streaming the resolver (built, not yet measurable)
+
+The resolver now emits **two JSON objects back to back**. The first, the scene,
+is everything the narrator needs: intent, duration, `player_location`,
+`uncertain`, summary, `you_said_aloud`, new entities, new facts, perceived,
+dialogue. The second, the ledger, holds what the player does not perceive this
+turn: superseded facts, deltas, moves, other people's knowledge, `ends_life`,
+and the roll.
+
+`llm.first_object_end` tracks brace depth through the stream and finds where the
+scene closes. At that moment the scene is validated, committed, and narrated —
+while the ledger is still being generated. Rule 1 still holds, because
+everything the narrator sees is in the store before it speaks, and the writes
+that land afterwards cannot change what this turn sounds like. On the measured
+17.8 s / 628-token baseline, the scene is roughly the first 150 tokens, which
+should put narration at about 4.4 s.
+
+Rolls keep the slow path on purpose: rule 6 wants both outcomes written before
+code rolls, and a stream only has both at the end. `uncertain: true` tells the
+engine to wait for the ledger. Rolls are meant to be rare.
+
+Two trade-offs this bought:
+
+- Delta validation used to spend the retry. The ledger now arrives after the
+  scene is committed and narrated, so an unbacked delta is reported as a
+  dropped write instead of refusing the turn.
+- A malformed ledger cannot be retried, because part of the turn is already
+  true and already spoken. It raises `LedgerFailed`, distinct from
+  `ModelCallFailed`, and says so loudly — a missing delta means wrong money.
+
+`CallRecord.scene_seconds` records time-to-narration separately from the whole
+call, since that is what the player actually waits for.
+
+**It cannot be measured on this key.** The verification run's spawn call took
+**630 seconds**. The free tier's in-flight budget makes the provider queue
+requests for minutes, which swamps any per-token timing. Raising the in-flight
+ceiling with real credit is a prerequisite for believing any latency number.
+
+**The free tier has an in-flight budget.** Four turns across the two runs died
+on OpenRouter 402 `in_flight_budget_exhausted` with `Retry-After: 120`, which
+the engine reported to the player as "say it again". Transient statuses now get
+one quiet retry, 402 raises `OutOfCredit` and ends the session cleanly with the
+world saved, and every refused turn is written to `logs/failures.log`. The key's
+limit is $3, not the $10 first reported.
