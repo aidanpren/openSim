@@ -70,10 +70,10 @@ tests/
 ## Done when
 
 - [x] Freedom test transcripts are in `logs/freedom/`, and the player has chosen models.
-- [ ] `uv run pytest` passes with networking off.
-- [ ] **Revisit:** describe a bar, leave, and come back. It's the same bartender with the same details. Automated with `FakeLLM`, then confirmed in a playtest.
-- [ ] **Relaunch:** `/quit` mid-scene, relaunch, and continue from the same place, time, and sheet.
-- [ ] **Items:** pick something up and it's on the sheet; give it away and it's gone.
+- [x] `uv run pytest` passes with networking off. *(148 tests, `./.venv/bin/python -m pytest` on this machine.)*
+- [x] **Revisit:** describe a bar, leave, and come back. It's the same bartender with the same details. Automated with `FakeLLM`, then confirmed in a playtest. *(`test_persistence.py`, and live in `runC-streamed.md`: "Gary the bartender glances up from wiping the counter, his tired eyes recognizing you from earlier")*
+- [x] **Relaunch:** `/quit` mid-scene, relaunch, and continue from the same place, time, and sheet.
+- [x] **Items:** pick something up and it's on the sheet; give it away and it's gone.
 - [x] **Money:** a win or a purchase changes cash by exactly the delta.
 - [x] **Hidden facts:** a `hidden` fact never appears in a logged narrator prompt.
 - [x] **Rolls:** a risky action logs its odds, both outcomes, and the result, and the narration mentions none of them.
@@ -151,10 +151,25 @@ Two trade-offs this bought:
 `CallRecord.scene_seconds` records time-to-narration separately from the whole
 call, since that is what the player actually waits for.
 
-**It cannot be measured on this key.** The verification run's spawn call took
-**630 seconds**. The free tier's in-flight budget makes the provider queue
-requests for minutes, which swamps any per-token timing. Raising the in-flight
-ceiling with real credit is a prerequisite for believing any latency number.
+**Measured in `runC-streamed.md`, on a paid account: 20.1 s → 9.4 s to the
+first narrated word.** A real 2.1x, zero failed calls. But the target is 4 s,
+and the split was made in the wrong place:
+
+| turn | to scene | full call | output tokens |
+|---|---|---|---|
+| 1 | 13.1 s | 15.7 s | 621 |
+| 2 | 7.4 s | 9.4 s | 312 |
+| 5 | 5.9 s | 8.0 s | 250 |
+
+The scene is about **75%** of the generation, not the 24% predicted, because
+`new_facts` and `new_entities` are the bulk of the output and have to be in the
+scene — perception is built from facts that must already be in the store, and
+moving them after narration would break rule 1.
+
+So the remaining lever really is compacting how a fact is written: fewer tokens
+per fact, defaults for the common `source`/`visibility`, and settling less per
+turn. Streaming bought the first 2x; compaction has to buy the rest. Worth
+measuring before building: at 36 tok/s the scene needs to reach ~135 tokens.
 
 **The free tier has an in-flight budget.** Four turns across the two runs died
 on OpenRouter 402 `in_flight_budget_exhausted` with `Retry-After: 120`, which
@@ -162,3 +177,98 @@ the engine reported to the player as "say it again". Transient statuses now get
 one quiet retry, 402 raises `OutOfCredit` and ends the session cleanly with the
 world saved, and every refused turn is written to `logs/failures.log`. The key's
 limit is $3, not the $10 first reported.
+
+## What the code review of 2026-10-11 changed
+
+Five rule breaches, all reproduced before being fixed and pinned by tests.
+
+1. **Rule 5: an entity's name leaked what its facts hid.** Standing in a room
+   counted as perceiving everything in it, so `thing:revolver` named "a
+   revolver taped under the sink" went to the narrator intact. `present` is now
+   filtered by `Narrator._can_make_out`: an entity reaches the narrator only if
+   the character knows a fact about it or it has a fact that is not `hidden`.
+2. **Rule 5: the character knew their own secrets.** `begin_life` taught the
+   player every fact written on them, hidden included, so a warrant nobody had
+   served was in the opening narration. Decided: `hidden` counts the subject
+   among the people it hides from (spec 2.1). Cash is `noticeable` now, and
+   `spawn.md` no longer says both things at once.
+3. **Rule 5: `/sheet` read the truth.** It was a second way around the
+   narrator's filter. It reads the character's knowledge now, so it shows a
+   false belief where one is held.
+4. **Rule 4 stopped at perception.** A knowledge row pointed at one fact
+   forever: a character who had learned `cash_usd = 41` still believed 41 after
+   spending six. `Store._carry_self_knowledge` moves the subject's own row onto
+   the fact that replaced it; nobody else's moves, so a changed lock is still
+   something you discover (spec 6.5).
+5. **Rule 9: a rejected scene was billed and never logged.** Two calls went out
+   and one record was written, which hid the retry and under-reported the
+   session spend — the measurement this milestone still owes.
+
+**Spec 5.2 now has teeth.** `config.token_budgets` was read by no code at all.
+`budget.py` holds `estimate_tokens` and `take_within`; `render.context` and
+`resolve.truth_here` fill their budgets in the spec's priority order and then
+trim for certain. `test_budget.py` runs 500 turns and measures every prompt.
+The narrator used to carry the character's whole history and the resolver every
+entity nested in wherever the player stood.
+
+**Contexts go out compact.** `indent=2` cost 39% more input tokens for
+whitespace no model reads, and it meant the budget measured something narrower
+than what was actually sent. `budget.as_prompt` is the one place that decides
+the wire form.
+
+**The turn is one transaction.** It was a few dozen separate commits, so a
+crash or a refused write partway through could leave the clock advanced over a
+half-written world. `Store.transaction()` nests; WAL plus
+`synchronous = NORMAL` takes the fsyncs off the path the player waits on.
+
+**The stream splitter is linear.** It rescanned the whole buffer on every
+chunk, on the one path the player is actually waiting on. `ObjectScanner`
+carries its brace depth between chunks, and `json_start` waits until the offset
+cannot change. The ledger is located the same way instead of parsed whole, so a
+closing fence or a line of trailing prose no longer costs a delta.
+
+**The narrator never sees the player's words.** It got the raw typed text, and
+run B read it straight back twice. It gets the resolver's one-line `intent`
+now, so defect 2 is structural rather than policed by a regex afterwards. That
+regex also stopped firing on "Gary asks what you want" — every false positive
+spent a second narrator call.
+
+**Smaller things.** `/time` follows the character out of the spawn city by
+walking the containment chain, with a cycle guard. `_place_player` reports a
+nonsense location as a dropped write instead of losing the turn. The sheet
+groups people by id, so two Garys stay two people.
+
+**Friction was the wrong idea, and the prompt was making it worse.** Both
+`spawn.md` and the design docs asked for "at least one source of friction: a
+debt, a job in trouble, a strained relationship, a problem" — four kinds of
+hardship. So every spawn was a broke, tired, working-class man, which is not
+what friction means and is nowhere near what most lives look like.
+
+Friction is the distance between what someone wants and what they have, and it
+exists at every station. An oil man's daughter of thirty-one with an allowance
+and no say in anything has it. So does a mechanic whose shop is fine and whose
+brother keeps borrowing the van.
+
+A prompt cannot hold a distribution, so code draws one: `resolve.STATIONS` with
+weights, `draw_station` called by `begin_life` from the session's own generator
+(rule 6 — the dice are code's). The ordinary middle is 90% of spawns, and both
+extremes are edge cases at 4% and 6%. `spawn.md` is told the station is a
+constraint rather than a mood, and that destitute-and-friendless is one life in
+twenty-five, not the default.
+
+### Still open
+
+- The **playtest** and **cost** boxes above need a live 30-turn session. Worth
+  watching for: whether the station actually changes the kind of life written,
+  or the model finds its way back to the line cook regardless.
+- Latency: the agreed lever is compacting what a fact costs, measured live.
+  Target is ~135 tokens for the scene.
+- `scene_change` is parsed and still read by nothing, as planned for M2.
+
+### Decided, not outstanding
+
+- **Dropped writes stay in `/dev`.** The player never hears that a consequence
+  went missing. It is a dev concern, not an in-world event.
+- **No stored RNG seed.** A session is not meant to be replayable. Rule 6 wants
+  the dice to come from code and be seedable for tests, which they are; it does
+  not want a world that can be rewound.

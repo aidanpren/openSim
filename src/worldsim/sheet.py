@@ -25,19 +25,29 @@ THREAD_HINTS = ("debt", "owes", "owed", "deadline", "promise", "rent", "due")
 
 
 def character_sheet(store: Store) -> str:
-    """The sheet as spoken-plain text, for /sheet."""
-    facts = {f.key: f for f in store.live_facts(PLAYER_ID)}
+    """The sheet as spoken-plain text, for /sheet.
+
+    Built from what the character knows, not from the truth. The sheet is
+    something the player reads, so it is bound by rule 5 like the narrator is:
+    a fact hidden from this character has no business on their own sheet, and
+    where they hold a false belief, the belief is what they would tell you.
+    """
+    facts = {
+        held.fact.key: held
+        for held in store.known(PLAYER_ID)
+        if held.fact.entity_id == PLAYER_ID
+    }
     used: set[str] = set()
     lines: list[str] = []
 
     for heading, keys in SECTIONS:
         rows = []
         for key in keys:
-            fact = facts.get(key)
-            if fact is None:
+            held = facts.get(key)
+            if held is None:
                 continue
             used.add(key)
-            rows.append(f"  {key.replace('_', ' ')}: {_show(fact.value)}")
+            rows.append(f"  {key.replace('_', ' ')}: {_show(held.value)}")
         if heading == "On you":
             carried = store.contents(PLAYER_ID)
             if carried:
@@ -48,8 +58,8 @@ def character_sheet(store: Store) -> str:
             lines.append("")
 
     threads = [
-        f"  {f.key.replace('_', ' ')}: {_show(f.value)}"
-        for key, f in facts.items()
+        f"  {key.replace('_', ' ')}: {_show(held.value)}"
+        for key, held in facts.items()
         if key not in used and any(hint in key.lower() for hint in THREAD_HINTS)
     ]
     if threads:
@@ -64,7 +74,11 @@ def character_sheet(store: Store) -> str:
         lines.extend(f"  {name}: {detail}" for name, detail in people)
         lines.append("")
 
-    leftover = [f"  {k.replace('_', ' ')}: {_show(f.value)}" for k, f in facts.items() if k not in used]
+    leftover = [
+        f"  {key.replace('_', ' ')}: {_show(held.value)}"
+        for key, held in facts.items()
+        if key not in used
+    ]
     if leftover:
         lines.append("Also true of you")
         lines.extend(leftover)
@@ -76,16 +90,19 @@ def character_sheet(store: Store) -> str:
 
 
 def _people_you_know(store: Store) -> list[tuple[str, str]]:
-    """Whom the player knows, from their own knowledge rather than the truth."""
-    by_person: dict[str, list[str]] = {}
+    """Whom the player knows, from their own knowledge rather than the truth.
+
+    Keyed by id, not name: a world this size will have two people called Gary,
+    and grouping by name merged them into one.
+    """
+    by_person: dict[str, tuple[str, list[str]]] = {}
     for held in store.known(PLAYER_ID):
         entity = store.entity(held.fact.entity_id)
         if entity is None or entity.kind != "person" or entity.id == PLAYER_ID:
             continue
-        by_person.setdefault(entity.name, []).append(
-            f"{held.fact.key.replace('_', ' ')} {_show(held.value)}"
-        )
-    return [(name, "; ".join(details[:3])) for name, details in by_person.items()]
+        name, details = by_person.setdefault(entity.id, (entity.name, []))
+        details.append(f"{held.fact.key.replace('_', ' ')} {_show(held.value)}")
+    return [(name, "; ".join(details[:3])) for name, details in by_person.values()]
 
 
 def _show(value: str | float) -> str:

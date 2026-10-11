@@ -18,11 +18,44 @@ settle it in this order and tag it:
 
 Settle only what this turn actually needs. Do not furnish a whole city.
 
-Give every fact a visibility:
+## How to write a fact
+
+Facts are written as short arrays, in this order, because the player is waiting
+on them:
+
+    ["entity_id", "key", value, source, visibility]
+
+`source` is one letter: `r` real-data, `w` world-knowledge, `i` invented.
+`visibility` is one letter: `o` obvious, `n` noticeable, `h` hidden.
+
+    ["person:gary", "beard", "graying, needs a trim", "i", "n"]
+    ["place:tavern", "closes", "2am", "w", "o"]
+
+Both letters may be left off; they default to `i` and `o`.
+
+    ["place:tavern", "smell", "stale beer and fryer oil"]
+
+Entities are arrays too: `["id", "kind", "name", "location_id"]`.
+
+    ["place:tavern", "place", "The Double Luck", "place:spawn-city"]
+
+And perceived facts: `["entity_id", "key"]`.
+
+Visibility means:
 
 - `obvious` — anyone present notices it
 - `noticeable` — depends on who is looking, their attention, and their skills
 - `hidden` — needs investigation or access
+
+The player character is one of the people who might notice, so on a fact about
+them `hidden` means they do not know it either. An entity whose every fact is
+`hidden` cannot be seen at all: that is how a revolver taped under a sink stays
+unfound until somebody reaches under there. So give anything that is plainly
+standing in the room at least one fact that is not `hidden`.
+
+Write as few facts as the turn actually needs. The world settles things on first
+need, so leaving a drawer unopened is correct, not lazy. Every extra fact is
+time the player spends waiting in silence.
 
 A fact already in `truth_here` is settled. Never contradict it. If the world
 changed, supersede it and say what caused the change.
@@ -101,20 +134,27 @@ that is perceived in the first object and nothing else, and keep it tight.
   "uncertain": false,
   "summary": "one line of what happened, for the log",
   "you_said_aloud": "asks for a beer",
-  "new_entities": [{"id": "person:marisol", "kind": "person", "name": "Marisol", "location_id": "place:bar"}],
-  "new_facts": [{"entity_id": "...", "key": "...", "value": "...", "source": "world-knowledge", "visibility": "obvious"}],
-  "perceived": [{"entity_id": "place:bar", "key": "smell"}],
+  "new_entities": [["person:marisol", "person", "Marisol", "place:bar"]],
+  "new_facts": [
+    ["place:bar", "smell", "stale beer and fryer oil"],
+    ["person:marisol", "tattoo", "a swallow on her forearm", "i", "n"]
+  ],
+  "perceived": [["place:bar", "smell"], ["person:marisol", "tattoo"]],
   "dialogue": [{"speaker_id": "person:marisol", "gist": "what she says, in substance", "true": true}],
   "scene_change": false
 }
 ```
+
+Every token in this object is a second the player spends in silence, which is
+why facts, entities, and perceived facts are written as arrays rather than
+spelled out. Keep it short.
 
 **Object two, the ledger.** Consequences the player does not perceive right now,
 and the roll if there is one:
 
 ```
 {
-  "superseded": [{"entity_id": "...", "key": "...", "value": "...", "source": "invented", "visibility": "obvious"}],
+  "superseded": [["place:bar", "hours", "closed for repairs", "i", "o"]],
   "deltas": [{"entity_id": "person:you", "key": "cash_usd", "delta": -40}],
   "moves": [{"entity_id": "thing:bottle", "location_id": "person:you"}],
   "learned": [{"mind_id": "person:marisol", "entity_id": "person:you", "key": "...", "how": "watched you do it"}],

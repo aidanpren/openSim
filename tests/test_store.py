@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
-from worldsim.store import ClockWentBackward, FactConflict, StoreError
+from conftest import WORLD_START
+from worldsim.store import ClockWentBackward, FactConflict, Store, StoreError
 
 
 # ---- the clock (rule 7) ----
@@ -211,3 +214,44 @@ def test_recent_turns_come_back_oldest_first(world):
 
     recent = world.recent_turns(life.id, limit=3)
     assert [row["player_said"] for row in recent] == ["turn 2", "turn 3", "turn 4"]
+
+
+# ---- a turn is one commit, not thirty (spec 1) ----
+
+
+def test_a_transaction_commits_everything_or_nothing(world):
+    before = world.now()
+    with pytest.raises(StoreError):
+        with world.transaction():
+            world.advance(45)
+            world.add_fact("place:bar", "music", "a jukebox", "invented", "obvious", "t1")
+            world.add_fact("place:bar", "music", "a second one", "invented", "obvious", "t1")
+
+    # The clock did not creep forward over a world that was never written.
+    assert world.now() == before
+    assert world.live_fact("place:bar", "music") is None
+
+
+def test_a_transaction_that_finishes_is_durable(tmp_path):
+    path = tmp_path / "saves" / "w" / "world.db"
+    store = Store(path, starts_at=WORLD_START)
+    store.add_entity("place:bar", "place", "The Peanut")
+    with store.transaction():
+        store.advance(30)
+        store.add_fact("place:bar", "music", "a jukebox", "invented", "obvious", "t1")
+    store.close()
+
+    reopened = Store(path)
+    assert reopened.live_fact("place:bar", "music").value == "a jukebox"
+    assert reopened.now() == WORLD_START + timedelta(minutes=30)
+    reopened.close()
+
+
+def test_transactions_nest_so_store_methods_still_work_alone(world):
+    with world.transaction():
+        with world.transaction():
+            world.add_fact("place:bar", "music", "a jukebox", "invented", "obvious", "t1")
+        # The inner block must not have committed on its own: the outer one
+        # still owns the writes, and a failure here would roll both back.
+        assert world.live_fact("place:bar", "music") is not None
+    assert world.live_fact("place:bar", "music").value == "a jukebox"

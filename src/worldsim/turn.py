@@ -14,6 +14,7 @@ import json
 import random
 from dataclasses import dataclass, field
 
+from .llm import LedgerFailed
 from .render import BIOGRAPHY, Narrator
 from .resolve import (
     PLAYER_ID,
@@ -22,6 +23,7 @@ from .resolve import (
     Outcome,
     Resolver,
     Scene,
+    draw_station,
 )
 from .store import FactConflict, Life, Store, StoreError
 
@@ -39,6 +41,20 @@ class RollRecord:
 
     def as_json(self) -> str:
         return json.dumps(self.__dict__)
+
+
+@dataclass
+class _Committed:
+    """What the scene managed to commit, for play() to pick up afterwards.
+
+    The scene commits from inside the resolver's stream, so play() needs
+    somewhere to find it again — above all when the stream then dies and the
+    turn has to be salvaged rather than replayed.
+    """
+
+    scene: Scene | None = None
+    narration: str | None = None
+    noticed: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -80,22 +96,38 @@ class Turn:
             for row in self.store.recent_turns(life.id, limit=6)
         ]
         dropped: list[str] = []
-        sofar: dict = {"noticed": [], "narration": None}
+        committed = _Committed()
 
         def on_scene(scene: Scene) -> None:
-            # The clock moves only by the resolver's in-world duration (rule 7).
-            self.store.advance(scene.duration_minutes)
-            cause = f"turn: {scene.intent}"
-            self._entities(scene.new_entities, dropped)
-            self._facts(scene.new_facts, cause, dropped)
-            self._place_player(scene.player_location, dropped)
-            sofar["noticed"] = self._perceive(scene.perceived, dropped)
+            # One transaction, so a write the store refuses partway through
+            # cannot leave the clock advanced over a half-written world. It
+            # closes before the narrator is called, which is what keeps rule 1
+            # true: everything the narrator sees is committed before it speaks.
+            with self.store.transaction():
+                # The clock moves only by the resolver's duration (rule 7).
+                self.store.advance(scene.duration_minutes)
+                cause = f"turn: {scene.intent}"
+                self._entities(scene.new_entities, dropped)
+                self._facts(scene.new_facts, cause, dropped)
+                self._place_player(scene.player_location, dropped)
+                noticed = self._perceive(scene.perceived, dropped)
+            committed.scene = scene
+            committed.noticed = noticed
             if not scene.uncertain:
-                sofar["narration"] = self.narrator.narrate(
-                    player_said, scene.dialogue, sofar["noticed"], scene.you_said_aloud
+                committed.narration = self.narrator.narrate(
+                    scene.intent, scene.dialogue, noticed, scene.you_said_aloud
                 )
 
-        scene, ledger = self.resolver.resolve(player_said, recent, on_scene)
+        try:
+            scene, ledger = self.resolver.resolve(player_said, recent, on_scene)
+        except LedgerFailed as exc:
+            # The scene is already true and the player has already heard it, so
+            # losing the narration on top of losing the ledger is the worst of
+            # both. Keep what happened and report what didn't.
+            if committed.scene is None:
+                raise
+            scene, ledger = committed.scene, Ledger()
+            dropped.append(f"ledger unusable, consequences missing: {exc}")
         cause = f"turn: {scene.intent}"
 
         roll_record = None
@@ -104,32 +136,33 @@ class Turn:
         dialogue = scene.dialogue
         said_aloud = scene.you_said_aloud
 
-        if ledger.roll is not None:
-            # Both outcomes exist in full before code rolls (rule 6).
-            rolled = self.rng.random()
-            succeeded = rolled < ledger.roll.p_success
-            branch = ledger.roll.on_success if succeeded else ledger.roll.on_failure
-            roll_record = RollRecord(
-                p_success=ledger.roll.p_success,
-                why=ledger.roll.why,
-                rolled=rolled,
-                succeeded=succeeded,
-                on_success=ledger.roll.on_success.summary,
-                on_failure=ledger.roll.on_failure.summary,
-            )
-            self._apply_outcome(branch, cause, dropped)
-            self._place_player(branch.player_location, dropped)
-            sofar["noticed"] += self._perceive(branch.perceived, dropped)
-            summary, ends_life = branch.summary, branch.ends_life
-            dialogue, said_aloud = branch.dialogue, branch.you_said_aloud
+        with self.store.transaction():
+            if ledger.roll is not None:
+                # Both outcomes exist in full before code rolls (rule 6).
+                rolled = self.rng.random()
+                succeeded = rolled < ledger.roll.p_success
+                branch = ledger.roll.on_success if succeeded else ledger.roll.on_failure
+                roll_record = RollRecord(
+                    p_success=ledger.roll.p_success,
+                    why=ledger.roll.why,
+                    rolled=rolled,
+                    succeeded=succeeded,
+                    on_success=ledger.roll.on_success.summary,
+                    on_failure=ledger.roll.on_failure.summary,
+                )
+                self._apply_outcome(branch, cause, dropped)
+                self._place_player(branch.player_location, dropped)
+                committed.noticed += self._perceive(branch.perceived, dropped)
+                summary, ends_life = branch.summary, branch.ends_life
+                dialogue, said_aloud = branch.dialogue, branch.you_said_aloud
 
-        self._apply_ledger(ledger, scene, cause, dropped)
+            self._apply_ledger(ledger, scene, cause, dropped)
 
         # Roll turns could not narrate from the scene alone, so they narrate here.
-        narration = sofar["narration"]
+        narration = committed.narration
         if narration is None:
             narration = self.narrator.narrate(
-                player_said, dialogue, sofar["noticed"], said_aloud
+                scene.intent, dialogue, committed.noticed, said_aloud
             )
         self.store.log_turn(
             life_id=life.id,
@@ -146,7 +179,7 @@ class Turn:
             roll=roll_record,
             summary=summary,
             ends_life=ends_life,
-            noticed_fact_ids=sofar["noticed"],
+            noticed_fact_ids=committed.noticed,
             dropped=dropped,
         )
 
@@ -157,7 +190,14 @@ class Turn:
         if self.store.entity(location_id) is None:
             dropped.append(f"player_location {location_id}: no such place, left in place")
         elif self.store.entity(PLAYER_ID).location_id != location_id:
-            self.store.move(PLAYER_ID, location_id)
+            try:
+                self.store.move(PLAYER_ID, location_id)
+            except StoreError as exc:
+                # Every other proposal in the turn is drained and reported this
+                # way. This one escaped, which turned a nonsense location — the
+                # player inside themselves — into a lost turn instead of a
+                # dropped write.
+                dropped.append(f"player_location {location_id}: {exc}")
 
     def _apply_ledger(self, ledger, scene, cause: str, dropped: list[str]) -> None:
         """Consequences the player did not perceive, committed after narration."""
@@ -282,12 +322,17 @@ class Turn:
 
 
 def begin_life(
-    store: Store, resolver: Resolver, narrator: Narrator, spawn_city: str
+    store: Store,
+    resolver: Resolver,
+    narrator: Narrator,
+    spawn_city: str,
+    rng: random.Random,
 ) -> tuple[Life, str]:
     """Spawn a character and narrate the opening (build step 4).
 
     Code creates the city and the player shell so the model cannot get their
-    ids wrong, then the resolver fills in the person and their situation.
+    ids wrong, and draws how comfortable the life is before asking, then the
+    resolver fills in the person and their situation.
     """
     # Idempotent: a spawn that failed on the model call leaves these two behind
     # with no life started, and without this the world could never be opened
@@ -297,27 +342,36 @@ def begin_life(
     if store.entity(PLAYER_ID) is None:
         store.add_entity(PLAYER_ID, "person", "you", location_id=SPAWN_PLACE_ID)
 
-    spawned = resolver.spawn()
+    spawned = resolver.spawn(draw_station(rng))
     dropped: list[str] = []
-    turn = Turn(store, resolver, narrator, random.Random())
-    turn._entities(spawned.new_entities, dropped)
-    turn._facts(spawned.new_facts, "spawn", dropped)
-
-    # Stand them somewhere specific, so the whole town isn't in the room.
-    if spawned.player_starts_in and store.entity(spawned.player_starts_in):
-        store.move(PLAYER_ID, spawned.player_starts_in)
-
-    # A person knows themselves, and notices what is obvious where they stand.
+    turn = Turn(store, resolver, narrator, rng)
     noticed = []
-    for fact in store.live_facts(PLAYER_ID):
-        store.learn(PLAYER_ID, fact.id, "you have always known this")
-        noticed.append(fact.id)
-    player = store.entity(PLAYER_ID)
-    if player.location_id:
-        for fact in store.live_facts(player.location_id):
-            if fact.visibility == "obvious":
-                store.learn(PLAYER_ID, fact.id, "you can see it")
-                noticed.append(fact.id)
+
+    # A spawn is one world or none of it: half a life is not playable.
+    with store.transaction():
+        turn._entities(spawned.new_entities, dropped)
+        turn._facts(spawned.new_facts, "spawn", dropped)
+
+        # Stand them somewhere specific, so the whole town isn't in the room.
+        if spawned.player_starts_in and store.entity(spawned.player_starts_in):
+            store.move(PLAYER_ID, spawned.player_starts_in)
+
+        # A person knows themselves, except for what is hidden from them too.
+        # `hidden` is one scale, and the subject is on it: an undiagnosed
+        # illness or a warrant nobody has served is true about this character
+        # and not theirs to know. Teaching them everything on themselves put a
+        # warrant straight into the opening narration.
+        for fact in store.live_facts(PLAYER_ID):
+            if fact.visibility == "hidden":
+                continue
+            store.learn(PLAYER_ID, fact.id, "you have always known this")
+            noticed.append(fact.id)
+        player = store.entity(PLAYER_ID)
+        if player.location_id:
+            for fact in store.live_facts(player.location_id):
+                if fact.visibility == "obvious":
+                    store.learn(PLAYER_ID, fact.id, "you can see it")
+                    noticed.append(fact.id)
 
     life = store.start_life(PLAYER_ID)
     narration = narrator.narrate(

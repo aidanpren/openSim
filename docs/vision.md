@@ -48,7 +48,7 @@ That's why this isn't a pile of features. Every detail is a consequence of the w
 Every design decision answers to these.
 
 - **Freedom with weight.** You can try anything, and everything costs something. There's no undo or reload, and the dice are real. When a character dies, they stay dead, and you begin again as someone new.
-- **Situations, not quests.** There are no objectives, markers, or checklists. Every life starts with its own friction: a job, a debt, a relationship, a problem. What you want grows out of that, and you decide what's worth chasing.
+- **Situations, not quests.** There are no objectives, markers, or checklists. Every life starts as somebody specific, with wants of their own and something standing in the way of them. That friction isn't the same as hardship: a rich man's daughter with an allowance and no say in anything has it, and so does a mechanic whose brother keeps borrowing the van. How comfortable a life starts is drawn, and both extremes are rare. What you want grows out of who you turned out to be, and you decide what's worth chasing.
 - **The world goes on.** Time moves, and people live their own lives whether or not you're watching. Ignore someone for months and they act on it. Even death doesn't reset it: your next life might walk past the store your last one burned.
 - **You are a person, not an avatar.** Your character has a history, skills, a body, and people who know them. Who they are shapes what you notice and how things go.
 - **Imagination is the screen.** The narration says what matters, not everything. Sound sets the mood without drawing the picture: the hum of a casino floor, wind along a desert fence. Images would overwrite what your mind builds.

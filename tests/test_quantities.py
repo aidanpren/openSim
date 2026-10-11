@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from worldsim.llm import FakeLLM, ModelCallFailed
 from worldsim.render import Narrator
-from worldsim.resolve import NewFact, Resolver, Supersede, is_quantity
+from worldsim.resolve import PLAYER_ID, NewFact, Resolver, Supersede, is_quantity
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR
 from helpers import reply
@@ -71,7 +71,7 @@ SPAWN_WITH_STRING_CASH = json.dumps(
         ],
         "new_facts": [
             {"entity_id": "person:you", "key": "name", "value": "Ethan Carter", "source": "invented", "visibility": "obvious"},
-            {"entity_id": "person:you", "key": "cash_usd", "value": "27", "source": "invented", "visibility": "hidden"},
+            {"entity_id": "person:you", "key": "cash_usd", "value": "27", "source": "invented", "visibility": "noticeable"},
         ],
         "player_starts_in": "place:diner",
         "opening_situation": "rent is late",
@@ -90,7 +90,7 @@ BUY_CIGARETTES = reply(
 def build(store, config, call_log, resolver_script, narrator_script):
     llm = FakeLLM(config, call_log, {"resolver": resolver_script, "narrator": narrator_script})
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
-    narrator = Narrator(llm, store, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
     return resolver, narrator, Turn(store, resolver, narrator, random.Random(7))
 
 
@@ -100,7 +100,7 @@ def test_a_purchase_changes_cash_by_exactly_the_delta(store, config, call_log):
         [SPAWN_WITH_STRING_CASH, BUY_CIGARETTES],
         ["The fryer ticks as it cools.", "The clerk slides them across."],
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     # Stored as a number despite the model sending a string.
     assert store.live_fact("person:you", "cash_usd").value == 27.0
@@ -115,17 +115,17 @@ def test_the_player_starts_in_a_specific_place_not_the_city(store, config, call_
     resolver, narrator, turn = build(
         store, config, call_log, [SPAWN_WITH_STRING_CASH], ["The fryer ticks."]
     )
-    begin_life(store, resolver, narrator, config.spawn_city)
+    begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     assert store.entity("person:you").location_id == "place:diner"
 
 
-def test_a_model_that_insists_on_superseding_cash_fails_the_turn(store, config, call_log):
+def test_a_model_that_insists_on_superseding_cash_cannot_change_it(store, config, call_log):
     bad = reply(
         {
             "superseded": [
                 {"entity_id": "person:you", "key": "cash_usd", "value": "18.50",
-                 "source": "invented", "visibility": "hidden"}
+                 "source": "invented", "visibility": "noticeable"}
             ]
         },
         intent="count what's left",
@@ -138,10 +138,64 @@ def test_a_model_that_insists_on_superseding_cash_fails_the_turn(store, config, 
         [SPAWN_WITH_STRING_CASH, bad, bad],
         ["The fryer ticks.", "unused"],
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
-    # Rejected, retried once, rejected again, so nothing commits (spec 3.3).
-    with pytest.raises(ModelCallFailed):
-        turn.play("I count what's left", life)
+    # Superseding a quantity now lands in the ledger, which arrives after the
+    # scene is committed and narrated, so it cannot be retried. What rule 4
+    # actually requires is that the total is untouched, and it is.
+    result = turn.play("I count what's left", life)
 
     assert store.live_fact("person:you", "cash_usd").value == 27.0
+    assert any("ledger unusable" in item for item in result.dropped)
+
+
+def test_what_you_know_about_your_own_money_follows_the_delta(world):
+    """Rule 4 reaches perception too, or the narrator is told the wrong number.
+
+    A knowledge row pointed at one fact forever, so a character who had learned
+    `cash_usd = 40` still believed 40 after spending six of it, and the
+    narrator and the sheet were both handed the superseded total.
+    """
+    cash = world.add_fact("person:you", "cash_usd", 40, "invented", "noticeable", "spawn")
+    world.learn(PLAYER_ID, cash.id, "you counted it")
+
+    world.apply_delta("person:you", "cash_usd", -6, "bought a beer")
+
+    held = [k for k in world.known(PLAYER_ID) if k.fact.key == "cash_usd"]
+    assert len(held) == 1, "one belief per key, not the old one alongside the new"
+    assert held[0].value == 34
+    assert world.live_fact("person:you", "cash_usd").value == 34
+
+
+def test_someone_else_keeps_believing_the_total_they_were_told(world):
+    """Only the subject's own knowledge follows. Everyone else needs telling."""
+    cash = world.add_fact("person:you", "cash_usd", 40, "invented", "noticeable", "spawn")
+    world.learn("person:bartender", cash.id, "watched you count it")
+
+    world.apply_delta("person:you", "cash_usd", -6, "bought a beer")
+
+    held = [k for k in world.known("person:bartender") if k.fact.key == "cash_usd"]
+    assert held[0].value == 40, "he did not see the rest of your night"
+
+
+def test_a_change_you_were_not_there_for_is_still_news(world):
+    """Spec 6.5: you find out about the new lock by putting a key in it."""
+    lock = world.add_fact("place:bar", "lock", "a brass deadbolt", "invented", "obvious", "saw it")
+    world.learn(PLAYER_ID, lock.id, "you can see it")
+
+    world.supersede("place:bar", "lock", "a new silver cylinder", "invented", "obvious", "changed")
+
+    held = [k for k in world.known(PLAYER_ID) if k.fact.key == "lock"]
+    assert held[0].value == "a brass deadbolt"
+    assert world.live_fact("place:bar", "lock").value == "a new silver cylinder"
+
+
+def test_a_belief_someone_holds_never_moves(world):
+    """A held belief is a snapshot of what they were told. That is the lie."""
+    owner = world.add_fact("place:bar", "owner", "Hal Brackett", "invented", "obvious", "gossip")
+    world.learn(PLAYER_ID, owner.id, "someone told you", belief="a guy from Topeka")
+
+    world.supersede("place:bar", "owner", "Dana Brackett", "invented", "obvious", "he sold it")
+
+    held = [k for k in world.known(PLAYER_ID) if k.fact.key == "owner"]
+    assert held[0].value == "a guy from Topeka"

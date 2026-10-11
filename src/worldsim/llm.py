@@ -14,7 +14,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -32,6 +32,10 @@ class OutOfCredit(ModelCallFailed):
     """The account has no credit left. Retrying will not help."""
 
 
+class ProviderBusy(ModelCallFailed):
+    """The provider's in-flight budget is exhausted. It clears on its own."""
+
+
 class LedgerFailed(ModelCallFailed):
     """The scene committed and was narrated, but its ledger was unusable.
 
@@ -45,6 +49,10 @@ class LedgerFailed(ModelCallFailed):
 # the player as "say it again". These are worth one quiet retry instead.
 TRANSIENT_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 TRANSIENT_BACKOFF_SECONDS = 2.0
+# OpenRouter hints Retry-After: 120 for an exhausted in-flight budget, but it
+# usually clears as soon as the earlier requests settle, so wait less and let
+# the player retry rather than freezing the turn for two minutes.
+IN_FLIGHT_BACKOFF_SECONDS = 8.0
 
 
 @dataclass
@@ -87,6 +95,24 @@ RETRY_PREAMBLE = (
 )
 
 
+@dataclass
+class _Streamed:
+    """How far one streamed attempt got. Owned by the caller of _stream_attempt.
+
+    `first` being set means the scene was valid and `on_first` has already run,
+    which is what tells the retry logic that the turn can no longer be replayed
+    from the top.
+    """
+
+    first: Any = None
+    buffer: str = ""
+    json_start: int = 0
+    split_at: int = 0
+    seconds: float = 0.0
+    scene_seconds: float | None = None
+    error: Exception | str = "the reply contained no complete JSON object"
+
+
 class _BaseLLM:
     """Shared retry-and-validate logic. Subclasses only implement _raw."""
 
@@ -101,6 +127,45 @@ class _BaseLLM:
         """Return (text, input_tokens, output_tokens)."""
         raise NotImplementedError
 
+    def _transport_failed(
+        self, exc: Exception, role: str, model: str, started: float,
+        attempt: int, transport_try: int,
+    ) -> None:
+        """Log a failed call and classify it. Returns only if worth retrying.
+
+        Shared by the plain and streaming paths. It used to live only in
+        `_call`, which left the streaming path — now the main one — with no
+        error handling at all.
+        """
+        self.call_log.write(
+            CallRecord(role, model, 0, 0, 0.0, time.monotonic() - started,
+                       attempt, ok=False, error=str(exc))
+        )
+        status = getattr(exc, "status_code", None)
+        message = str(exc).lower()
+
+        if status == 402:
+            # Several different problems share this status.
+            if "in_flight" in message:
+                # Clears on its own once earlier requests settle.
+                if transport_try == 1:
+                    time.sleep(IN_FLIGHT_BACKOFF_SECONDS)
+                    return
+                raise ProviderBusy(
+                    "The model provider is still working through earlier "
+                    "requests. Wait a moment and say it again."
+                ) from exc
+            raise OutOfCredit(
+                "This key cannot afford the request. Either its weekly limit is "
+                "spent, the account is empty, or max_tokens reserves more than "
+                "is left. OpenRouter said: " + str(exc)
+            ) from exc
+
+        if status in TRANSIENT_STATUSES and transport_try == 1:
+            time.sleep(TRANSIENT_BACKOFF_SECONDS)
+            return
+        raise ModelCallFailed(f"{role} call failed: {exc}") from exc
+
     def _call(self, role: str, system: str, user: str, attempt: int) -> str:
         model = self.config.model_for(role)
         for transport_try in (1, 2):
@@ -109,20 +174,10 @@ class _BaseLLM:
                 text, input_tokens, output_tokens = self._raw(role, model, system, user)
                 break
             except Exception as exc:
-                self.call_log.write(
-                    CallRecord(role, model, 0, 0, 0.0, time.monotonic() - started,
-                               attempt, ok=False, error=str(exc))
+                self._transport_failed(
+                    exc, role, model, started, attempt, transport_try
                 )
-                status = getattr(exc, "status_code", None)
-                if status == 402:
-                    raise OutOfCredit(
-                        "The account is out of credit. Add some at "
-                        "https://openrouter.ai/settings/credits"
-                    ) from exc
-                if status in TRANSIENT_STATUSES and transport_try == 1:
-                    time.sleep(TRANSIENT_BACKOFF_SECONDS)
-                    continue
-                raise ModelCallFailed(f"{role} call failed: {exc}") from exc
+                continue
 
         price = self.config.price_for(model)
         self.call_log.write(
@@ -146,6 +201,54 @@ class _BaseLLM:
     def _raw_stream(self, role: str, model: str, system: str, user: str):
         """Yield output in chunks. Sets self._stream_usage when finished."""
         raise NotImplementedError
+
+    def _stream_attempt(
+        self,
+        streamed: _Streamed,
+        role: str,
+        model: str,
+        system: str,
+        user: str,
+        first_shape: type[T],
+        on_first: Callable[[T], None],
+        check: Callable[[T], None] | None,
+    ) -> None:
+        """One pass over the stream, writing its progress into `streamed`.
+
+        `streamed` is the caller's, not a return value, because an exception
+        thrown after `on_first` has fired still has to leave behind the fact
+        that it fired: by then the scene is committed and spoken for.
+        """
+        scanner: ObjectScanner | None = None
+        started = time.monotonic()
+        for chunk in self._raw_stream(role, model, system, user):
+            streamed.buffer += chunk
+            streamed.seconds = time.monotonic() - started
+            if streamed.first is not None:
+                continue  # the scene is away; just collect the ledger
+            if scanner is None:
+                start = json_start(streamed.buffer)
+                if start is None:
+                    continue
+                streamed.json_start = start
+                scanner = ObjectScanner(start)
+            end = scanner.feed(streamed.buffer)
+            if end is None:
+                continue
+            body = streamed.buffer[streamed.json_start : end]
+            try:
+                candidate = first_shape.model_validate_json(body)
+                if check is not None:
+                    check(candidate)
+            except (ValidationError, ValueError) as exc:
+                # Nothing is committed yet, so abandon the rest of the stream
+                # and spend the retry (spec 3.3) with the reason attached.
+                streamed.error = exc
+                return
+            streamed.first, streamed.split_at = candidate, end
+            streamed.scene_seconds = time.monotonic() - started
+            on_first(candidate)
+        streamed.seconds = time.monotonic() - started
 
     def stream_pair(
         self,
@@ -174,66 +277,91 @@ class _BaseLLM:
             if attempt == 2:
                 user = user + "\n\n" + RETRY_PREAMBLE.format(error=str(error))
             model = self.config.model_for(role)
-            started = time.monotonic()
-            buffer = ""
-            first = None
-            split_at = None
+            streamed = _Streamed()
 
-            for chunk in self._raw_stream(role, model, system, user):
-                buffer += chunk
-                if first is not None:
-                    continue
-                end = first_object_end(_strip_fences(buffer))
-                if end is None:
-                    continue
-                cleaned = _strip_fences(buffer)
+            for transport_try in (1, 2):
+                started = time.monotonic()
+                streamed = _Streamed()
                 try:
-                    candidate = first_shape.model_validate_json(cleaned[:end])
-                    if check is not None:
-                        check(candidate)
-                except (ValidationError, ValueError) as exc:
-                    error = exc
-                    first = None
-                    split_at = None
-                    break
-                first, split_at = candidate, end
-                scene_seconds = time.monotonic() - started
-                on_first(first)
-
-            if first is not None:
-                usage = self._stream_usage
-                self.call_log.write(
-                    CallRecord(
-                        role=role,
-                        model=model,
-                        input_tokens=usage[0],
-                        output_tokens=usage[1],
-                        cost_cents=(
-                            price.cents(*usage)
-                            if (price := self.config.price_for(model))
-                            else 0.0
-                        ),
-                        seconds=time.monotonic() - started,
-                        attempt=attempt,
-                        ok=True,
-                        scene_seconds=scene_seconds,
+                    self._stream_attempt(
+                        streamed, role, model, system, user,
+                        first_shape, on_first, check,
                     )
-                )
+                except Exception as exc:
+                    if streamed.first is not None:
+                        # The scene is already committed and narrated, so the
+                        # call cannot be replayed from the top.
+                        self._log_stream(role, model, streamed, attempt)
+                        raise LedgerFailed(
+                            f"{role} died after its scene was committed: {exc}"
+                        ) from exc
+                    self._transport_failed(
+                        exc, role, model, started, attempt, transport_try
+                    )
+                    continue
+                break
 
-            if first is None:
+            # Every attempt that reached the provider is logged, whether or not
+            # its scene survived validation (rule 9). A rejected one used to
+            # vanish, which hid the retry and under-reported the session spend.
+            self._log_stream(role, model, streamed, attempt)
+
+            if streamed.first is None:
+                error = streamed.error
                 if attempt == 2:
                     raise ModelCallFailed(f"{role} scene was unusable twice: {error}")
                 continue
 
-            rest = _strip_fences(buffer)[split_at:].strip()
             try:
-                return first, second_shape.model_validate_json(rest or "{}")
+                return streamed.first, self._second_object(streamed, second_shape)
             except (ValidationError, ValueError) as exc:
                 raise LedgerFailed(
                     f"{role} scene committed but its ledger was unusable: {exc}"
                 ) from exc
 
         raise ModelCallFailed(f"{role} produced no scene")
+
+    @staticmethod
+    def _second_object(streamed: _Streamed, shape: type[S]) -> S:
+        """The ledger, found the same way the scene was.
+
+        Brace-scanning rather than parsing the whole remainder, because models
+        add a closing fence or a line of prose after the second object often
+        enough, and a lost ledger means wrong money.
+        """
+        rest = streamed.buffer[streamed.split_at :]
+        start = json_start(rest)
+        if start is None:
+            return shape.model_validate_json("{}")  # nothing followed the scene
+        end = ObjectScanner(start).feed(rest)
+        if end is None:
+            # Truncated, so there is no object to read. Let the shape decide
+            # whether an empty ledger is acceptable.
+            return shape.model_validate_json(rest[start:].strip() or "{}")
+        return shape.model_validate_json(rest[start:end])
+
+    def _log_stream(
+        self, role: str, model: str, streamed: _Streamed, attempt: int
+    ) -> None:
+        # An abandoned stream never reaches the provider's usage chunk, so a
+        # rejected scene logs zero tokens. The record still has to exist: it is
+        # the only trace that the attempt happened and why it was thrown away.
+        usage = self._stream_usage if streamed.first is not None else (0, 0)
+        price = self.config.price_for(model)
+        self.call_log.write(
+            CallRecord(
+                role=role,
+                model=model,
+                input_tokens=usage[0],
+                output_tokens=usage[1],
+                cost_cents=price.cents(*usage) if price else 0.0,
+                seconds=streamed.seconds,
+                attempt=attempt,
+                ok=streamed.first is not None,
+                error=None if streamed.first is not None else str(streamed.error),
+                scene_seconds=streamed.scene_seconds,
+            )
+        )
 
     def json(
         self,
@@ -271,33 +399,80 @@ class _BaseLLM:
                 ) from second
 
 
-def first_object_end(text: str) -> int | None:
-    """Index just past the first complete top-level JSON object, or None.
+class ObjectScanner:
+    """Finds where a top-level JSON object closes, one chunk at a time.
 
     This is what lets narration start before the resolver has finished writing:
-    the scene object closes long before the ledger that follows it.
+    the scene object closes long before the ledger that follows it. It keeps its
+    brace depth between calls, so a growing buffer is read once rather than
+    rescanned from the top on every chunk — the splitter sits on the one path
+    the player is actually waiting on, and rescanning made it quadratic in
+    output length.
     """
-    depth = 0
-    in_string = False
-    escaped = False
-    for index, char in enumerate(text):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-    return None
+
+    __slots__ = ("_depth", "_in_string", "_escaped", "_read", "_end")
+
+    def __init__(self, start: int = 0) -> None:
+        self._depth = 0
+        self._in_string = False
+        self._escaped = False
+        self._read = start
+        self._end: int | None = None
+
+    def feed(self, text: str) -> int | None:
+        """Index into `text` just past the object's closing brace, or None.
+
+        `text` must be the same buffer each time, only longer.
+        """
+        if self._end is not None:
+            return self._end
+        for index in range(self._read, len(text)):
+            char = text[index]
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                elif char == "\\":
+                    self._escaped = True
+                elif char == '"':
+                    self._in_string = False
+                continue
+            if char == '"':
+                self._in_string = True
+            elif char == "{":
+                self._depth += 1
+            elif char == "}":
+                self._depth -= 1
+                if self._depth == 0:
+                    self._end = index + 1
+                    return self._end
+        self._read = len(text)
+        return None
+
+
+def first_object_end(text: str) -> int | None:
+    """Index just past the first complete top-level JSON object, or None."""
+    return ObjectScanner().feed(text)
+
+
+def json_start(text: str) -> int | None:
+    """Where the JSON begins in a partial reply, or None if not yet knowable.
+
+    Models wrap output in ```json fences even when told not to. A streamed
+    reply has to be sliced at a stable offset, because the scanner remembers
+    how far it has read, so this waits until the answer cannot change: either a
+    non-fence character has arrived, or the fence's header line has closed.
+    """
+    index = 0
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index == len(text):
+        return None  # nothing but whitespace so far; a fence could still start
+    if text[index] == "`":
+        newline = text.find("\n", index)
+        if newline == -1:
+            return None  # still inside the fence header
+        return newline + 1
+    return index
 
 
 def _strip_fences(text: str) -> str:

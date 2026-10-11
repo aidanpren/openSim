@@ -8,7 +8,7 @@ import pytest
 from pydantic import BaseModel
 
 from worldsim.config import ModelPrice
-from worldsim.llm import FakeLLM, ModelCallFailed, OutOfCredit
+from worldsim.llm import FakeLLM, ModelCallFailed, OutOfCredit, ProviderBusy
 
 VALID = '{"intent": "pocket the whiskey", "duration_minutes": 1}'
 MISSING_FIELD = '{"intent": "pocket the whiskey"}'
@@ -139,6 +139,48 @@ def test_running_out_of_credit_is_not_retried(config, call_log):
     with pytest.raises(OutOfCredit):
         llm.json("resolver", "s", "u", Shape)
     assert llm.attempts == 1
+
+
+class BusyLLM(FlakyLLM):
+    """A 402 that is an exhausted in-flight budget, not an empty account."""
+
+    def _raw(self, role, model, system, user):
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise Boom402InFlight()
+        return FakeLLM._raw(self, role, model, system, user)
+
+
+class Boom402InFlight(Exception):
+    def __init__(self):
+        super().__init__(
+            "Error code: 402 - {'error': {'metadata': "
+            "{'reason': 'in_flight_budget_exhausted'}}}"
+        )
+        self.status_code = 402
+
+
+def test_an_exhausted_in_flight_budget_is_retried_not_called_out_of_credit(
+    config, call_log, monkeypatch
+):
+    """A live run told the player to add credit while they had $9.82."""
+    monkeypatch.setattr("worldsim.llm.IN_FLIGHT_BACKOFF_SECONDS", 0)
+    llm = BusyLLM(config, call_log, status=402, failures=1)
+
+    assert llm.json("resolver", "s", "u", Shape).duration_minutes == 1
+    assert llm.attempts == 2
+
+
+def test_a_provider_that_stays_busy_says_so_without_mentioning_credit(
+    config, call_log, monkeypatch
+):
+    monkeypatch.setattr("worldsim.llm.IN_FLIGHT_BACKOFF_SECONDS", 0)
+    llm = BusyLLM(config, call_log, status=402, failures=2)
+
+    with pytest.raises(ProviderBusy) as raised:
+        llm.json("resolver", "s", "u", Shape)
+    assert "credit" not in str(raised.value).lower()
+    assert not isinstance(raised.value, OutOfCredit)
 
 
 def test_a_plain_error_is_not_retried(config, call_log):

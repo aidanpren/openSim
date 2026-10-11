@@ -16,7 +16,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import ConfigError, load_config
-from .llm import CallLog, LedgerFailed, ModelCallFailed, OpenRouterLLM, OutOfCredit
+from .llm import (
+    CallLog,
+    LedgerFailed,
+    ModelCallFailed,
+    OpenRouterLLM,
+    OutOfCredit,
+    ProviderBusy,
+)
 from .render import Narrator
 from .resolve import PLAYER_ID, SPAWN_PLACE_ID, Resolver
 from .sheet import character_sheet
@@ -39,14 +46,37 @@ def latest_world(saves_dir: Path) -> Path | None:
     return max(worlds, key=lambda p: (p / "world.db").stat().st_mtime)
 
 
+def timezone_here(store: Store) -> str | None:
+    """The IANA zone of wherever the character is standing, or None.
+
+    Spec 6.1 shows the clock in local time where the character is, so a drive to
+    Denver has to change the hour. The zone is settled on whichever place holds
+    it — a city, usually, not a kitchen — so this walks outward through the
+    containment chain and falls back to the spawn city for a place the model
+    left unparented. `seen` guards against a containment cycle, which the store
+    permits: it only refuses an entity inside itself.
+    """
+    entity = store.entity(PLAYER_ID)
+    seen: set[str] = set()
+    while entity is not None and entity.id not in seen:
+        seen.add(entity.id)
+        fact = store.live_fact(entity.id, "timezone")
+        if fact is not None:
+            return str(fact.value)
+        entity = store.entity(entity.location_id) if entity.location_id else None
+    fallback = store.live_fact(SPAWN_PLACE_ID, "timezone")
+    return str(fallback.value) if fallback else None
+
+
 def local_time(store: Store) -> str:
     """The clock in the local time of wherever the character is (spec 6.1)."""
     now = store.now()
-    zone_fact = store.live_fact(SPAWN_PLACE_ID, "timezone")
-    if zone_fact:
+    zone = timezone_here(store)
+    if zone:
         try:
-            local = now.astimezone(ZoneInfo(str(zone_fact.value)))
-            return local.strftime("%A, %B %-d, %Y, %-I:%M %p ") + str(zone_fact.value)
+            return now.astimezone(ZoneInfo(zone)).strftime(
+                "%A, %B %-d, %Y, %-I:%M %p "
+            ) + zone
         except (ZoneInfoNotFoundError, ValueError):
             pass
     return now.strftime("%A, %B %-d, %Y, %-I:%M %p UTC")
@@ -114,14 +144,19 @@ def main() -> int:
     store = Store(world_dir / "world.db")
     llm = OpenRouterLLM(config, call_log)
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
-    narrator = Narrator(llm, store, PROMPTS_DIR)
-    turn = Turn(store, resolver, narrator, random.Random())
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    # One generator for the whole session: it draws the station a life starts
+    # at and then every roll in it (rule 6).
+    rng = random.Random()
+    turn = Turn(store, resolver, narrator, rng)
 
     life = store.current_life()
     if life is None:
         print(f"A new life in {config.spawn_city}.\n")
         try:
-            life, opening = begin_life(store, resolver, narrator, config.spawn_city)
+            life, opening = begin_life(
+                store, resolver, narrator, config.spawn_city, rng
+            )
         except (ModelCallFailed, StoreError) as exc:
             print(f"The world could not be started: {exc}", file=sys.stderr)
             store.close()
@@ -183,6 +218,11 @@ def main() -> int:
             log_failure(config, said, exc)
             print(f"\n{exc}\nYour world is saved. Add credit and relaunch.\n")
             break
+        except ProviderBusy as exc:
+            # Keeps the session alive: this clears on its own.
+            log_failure(config, said, exc)
+            print(f"\n{exc}\n")
+            continue
         except ModelCallFailed as exc:
             # The reason only lived in the retry prompt, which made a refused
             # turn impossible to diagnose after the fact.

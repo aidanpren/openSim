@@ -9,11 +9,13 @@ Created by __main__.py and called by turn.py.
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .budget import as_prompt, estimate_tokens, take_within
 from .config import Config
 from .llm import _BaseLLM
 from .store import Store
@@ -35,6 +37,13 @@ def is_quantity(key: str) -> bool:
     return key.endswith(QUANTITY_SUFFIXES)
 
 
+def as_text(value: str | float) -> str:
+    """Render a value as text without pydantic's float tail: 29, not 29.0."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def as_number(key: str, value: str | float) -> float:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -47,19 +56,56 @@ def as_number(key: str, value: str | float) -> float:
         ) from None
 
 
+# Facts are the bulk of what the player waits for, so they have a compact wire
+# form: ["person:gary", "beard", "graying", "i", "o"] instead of five quoted
+# keys. Both forms are accepted — a format slip would cost a whole retry, which
+# is far more expensive than the tokens saved.
+SOURCE_LETTERS = {"r": "real-data", "w": "world-knowledge", "i": "invented"}
+VISIBILITY_LETTERS = {"o": "obvious", "n": "noticeable", "h": "hidden"}
+
+
+def _expand(data, fields: tuple[str, ...], codes: dict):
+    """Turn a positional list into the keyword form, leaving dicts alone."""
+    if not isinstance(data, (list, tuple)):
+        return data
+    out = {}
+    for index, name in enumerate(fields):
+        if index >= len(data):
+            break
+        value = data[index]
+        if name in codes and isinstance(value, str):
+            value = codes[name].get(value.lower(), value)
+        out[name] = value
+    return out
+
+
 class NewEntity(BaseModel):
     id: str
     kind: str
     name: str
     location_id: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(data, ("id", "kind", "name", "location_id"), {})
+
 
 class NewFact(BaseModel):
     entity_id: str
     key: str
     value: str | float
-    source: Source
-    visibility: Visibility
+    source: Source = "invented"
+    visibility: Visibility = "obvious"
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(
+            data,
+            ("entity_id", "key", "value", "source", "visibility"),
+            {"source": SOURCE_LETTERS, "visibility": VISIBILITY_LETTERS},
+        )
 
     @model_validator(mode="after")
     def quantities_must_be_numbers(self) -> NewFact:
@@ -69,9 +115,21 @@ class NewFact(BaseModel):
 
 
 class Supersede(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(
+            data,
+            ("entity_id", "key", "value", "source", "visibility"),
+            {"source": SOURCE_LETTERS, "visibility": VISIBILITY_LETTERS},
+        )
+
     entity_id: str
     key: str
-    value: str
+    # Models send a bare number here for things like an age or a house number.
+    # A live turn was lost to that, so accept it and render it as text; a real
+    # quantity is refused below either way.
+    value: str | float
     source: Source
     visibility: Visibility
 
@@ -82,6 +140,7 @@ class Supersede(BaseModel):
                 f"{self.key!r} is a quantity; change it with a delta, never by "
                 "writing a new total"
             )
+        self.value = as_text(self.value)
         return self
 
 
@@ -117,6 +176,11 @@ class Line(BaseModel):
 class Perceived(BaseModel):
     entity_id: str
     key: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(data, ("entity_id", "key"), {})
 
 
 class Outcome(BaseModel):
@@ -187,6 +251,33 @@ class Ledger(BaseModel):
     roll: Roll | None = None
 
 
+# How comfortable a life starts, and how often. Code draws this rather than the
+# model, for two reasons. Rule 6: the dice belong to code. And a model asked for
+# "a person with at least one source of friction" writes the same broke, lonely,
+# exhausted line cook every time — which is not what friction means and is not
+# what most lives look like. The weights are the whole point: the ordinary
+# middle is the standard, and both extremes are edge cases.
+STATIONS: tuple[tuple[int, str], ...] = (
+    (4, "barely holding on: no savings, somewhere precarious to sleep, and a "
+        "week that could go wrong in a single move"),
+    (28, "working with no cushion: this month's bills are paid and nothing "
+         "beyond them"),
+    (40, "ordinary and reasonably settled: the money works out, which leaves "
+         "the room taken up by everything money does not fix"),
+    (22, "comfortable: property, savings, and choices most people do not have"),
+    (6, "wealthy: money is not a question this person has to ask, which is its "
+        "own kind of trap"),
+)
+
+
+def draw_station(rng: random.Random) -> str:
+    """Pick a station in life, weighted. Called by turn.begin_life."""
+    return rng.choices(
+        [description for _, description in STATIONS],
+        weights=[weight for weight, _ in STATIONS],
+    )[0]
+
+
 class SpawnOutput(BaseModel):
     new_entities: list[NewEntity] = Field(default_factory=list)
     new_facts: list[NewFact] = Field(default_factory=list)
@@ -210,15 +301,16 @@ class Resolver:
     def _prompt(self, name: str) -> str:
         return (self.prompts_dir / name).read_text()
 
-    def spawn(self) -> SpawnOutput:
-        user = json.dumps(
+    def spawn(self, station: str) -> SpawnOutput:
+        """Build a life. `station` is drawn by code, not chosen by the model."""
+        user = as_prompt(
             {
                 "city": self.config.spawn_city,
                 "local_time": self.store.now().isoformat(),
                 "player_entity_id": PLAYER_ID,
                 "city_entity_id": SPAWN_PLACE_ID,
-            },
-            indent=2,
+                "station_in_life": station,
+            }
         )
         return self.llm.json("resolver", self._prompt("spawn.md"), user, SpawnOutput)
 
@@ -229,18 +321,31 @@ class Resolver:
         on_scene: Callable[[Scene], None],
     ) -> tuple[Scene, Ledger]:
         """Stream one call. `on_scene` fires the moment the scene is valid."""
-        user = json.dumps(
-            {
-                "player_said": player_said,
-                "world_time": self.store.now().isoformat(),
-                "recent_turns": recent,
-                "truth_here": self.truth_here(),
-            },
-            indent=2,
+        # Spec 5.2's priority order: the instructions have the first claim on
+        # the budget, then what the player just said, then the facts where they
+        # are standing, then the scene so far. So the oldest turn is what goes
+        # when something has to.
+        system = self._prompt("resolver.md")
+        budget = self.config.token_budgets["resolver"] - estimate_tokens(system)
+        payload: dict = {
+            "player_said": player_said,
+            "world_time": self.store.now().isoformat(),
+            "recent_turns": [],
+            "truth_here": {},
+        }
+        room = budget - estimate_tokens(payload)
+        payload["truth_here"] = self.truth_here(budget_tokens=max(room, 0))
+        room = budget - estimate_tokens(payload)
+        payload["recent_turns"] = list(
+            reversed(take_within(list(reversed(recent)), max(room, 0)))
         )
+        # And then make it certain rather than estimated, oldest turn first.
+        while estimate_tokens(payload) > budget and payload["recent_turns"]:
+            payload["recent_turns"].pop(0)
+        user = as_prompt(payload)
         return self.llm.stream_pair(
             "resolver",
-            self._prompt("resolver.md"),
+            system,
             user,
             Scene,
             Ledger,
@@ -287,16 +392,25 @@ class Resolver:
                 )
         return problems
 
-    def truth_here(self) -> dict:
-        """The full truth at the player's location, hidden facts included.
+    def truth_here(self, budget_tokens: int | None = None) -> dict:
+        """The truth at the player's location, hidden facts included.
 
         Only the resolver ever sees this. render.py builds a different, smaller
         context for the narrator (rule 5).
+
+        It is trimmed to a budget (spec 5.2) because it had no upper bound: a
+        player standing in the bare city entity put every place and person in
+        town in the room, each with all of its facts, and a place the player
+        keeps returning to accumulates facts forever. Order is the priority
+        order — the character, the room, what they carry, then whoever else is
+        here, people before scenery — so the last thing dropped is the thing
+        least likely to matter.
         """
         player = self.store.entity(PLAYER_ID)
         here = player.location_id if player else None
-        present = self.store.contents(here) if here else []
+        present = [e for e in (self.store.contents(here) if here else []) if e.id != PLAYER_ID]
         carried = self.store.contents(PLAYER_ID)
+        present.sort(key=lambda e: (e.kind != "person", e.id))
 
         def facts_of(entity_id: str) -> dict:
             return {
@@ -304,19 +418,30 @@ class Resolver:
                 for fact in self.store.live_facts(entity_id)
             }
 
-        entities = {PLAYER_ID: facts_of(PLAYER_ID)}
-        if here:
-            entities[here] = facts_of(here)
-        for entity in present + carried:
-            entities[entity.id] = facts_of(entity.id)
-
-        return {
+        frame = {
             "you_are_in": here,
-            "present": [
-                {"id": e.id, "kind": e.kind, "name": e.name}
-                for e in present
-                if e.id != PLAYER_ID
-            ],
+            "present": [{"id": e.id, "kind": e.kind, "name": e.name} for e in present],
             "you_carry": [{"id": e.id, "name": e.name} for e in carried],
-            "facts": entities,
         }
+        if budget_tokens is None:
+            budget_tokens = self.config.token_budgets["resolver"]
+
+        ordered = [PLAYER_ID] + ([here] if here else [])
+        ordered += [e.id for e in carried] + [e.id for e in present]
+        seen: set[str] = set()
+        slices = []
+        for entity_id in ordered:
+            if entity_id in seen:
+                continue
+            seen.add(entity_id)
+            slices.append((entity_id, facts_of(entity_id)))
+
+        room = budget_tokens - estimate_tokens(frame)
+        kept = take_within(slices, max(room, 0))
+        frame["facts"] = dict(kept)
+        # Exactly as in render.context: the estimate above ignores the JSON
+        # overhead of the keys themselves, and spec 5.2 is a hard bound.
+        while estimate_tokens(frame) > budget_tokens and len(kept) > 1:
+            kept.pop()
+            frame["facts"] = dict(kept)
+        return frame

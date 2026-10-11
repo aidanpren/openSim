@@ -31,6 +31,8 @@ A fact is one small true statement about an entity: the bartender's name, the st
 - its value: plain text, or a number for quantities
 - `source`: `real-data`, `world-knowledge` (what the model knows about the real place), or `invented`
 - `visibility`: `obvious` (anyone present notices), `noticeable` (depends on who's looking and how), or `hidden` (needs investigation or access)
+
+The person a fact is about is one of the people it hides from. On a fact about the player character, `hidden` means the character doesn't know it either: an illness with no diagnosis, a warrant nobody has served, what a relative has decided about them. Money in a pocket is `noticeable` — they know it, a stranger across the room doesn't. The same goes for an entity: something whose every fact is `hidden` isn't noticed by being in the room with it, which is how a revolver taped under a sink stays unfound.
 - `cause`: the turn or event that created it
 - `created_at`, in world time
 - `superseded_by`, set only when a later event changes it
@@ -54,6 +56,8 @@ The answer is committed at once and never re-resolved. Facts about the real worl
 ### 2.3 Who knows what
 
 Every mind has its own knowledge, including the player character's. Knowledge is the set of facts that mind has perceived, been told, or inferred, with when and how it learned each one. A knowledge entry can hold a belief that differs from the fact, which is how lies and mistakes live in the world.
+
+When a fact is superseded, knowledge of it does not move with it — that's how a mind goes on believing the lock is the one it last saw. The one exception is the fact's own subject, who is present for every change to themselves: your knowledge of your own cash follows the delta, or the narrator would be told a total you spent an hour ago. An entry that holds a belief never moves either way, because it's a record of what someone was told.
 
 - The resolver works from the truth.
 - The narrator works only from the player character's knowledge, false beliefs included. If the player was lied to, the narration reflects the lie until the world contradicts it.
@@ -228,7 +232,7 @@ Strangers are created on first meeting, and from then on they're permanent like 
 
 ## 9. Lives and the persistent world
 
-- **Spawning:** a new life starts as a specific person in a real city, with a name, age, job, history, people, and at least one source of friction: a debt, a job in trouble, a strained relationship, a problem. There are no quests; wants grow out of the situation. The default spawn city is Kansas City, Missouri, set by `SPAWN_CITY`.
+- **Spawning:** a new life starts as a specific person in a real city, with a name, age, job, history, and people. Code draws their station in life before the model is called, weighted so the ordinary middle is the standard and both extremes, destitute and wealthy, are rare. Whatever the station, the person wants something they don't have and something is in the way of it. That's the friction, and it isn't the same as hardship: an allowance with no say in anything is friction, and so is a brother who keeps borrowing the van. The weights live in `resolve.STATIONS`, because a model asked for "a person with at least one source of friction" writes the same broke, lonely line cook every time. There are no quests; wants grow out of the situation. The default spawn city is Kansas City, Missouri, set by `SPAWN_CITY`.
 - **Death:** death is permanent for that character. The life ends with one closing line, and the next life starts as someone new.
 - **The world outlives every life:** the dead character's possessions, property, and consequences stay. A new life might walk past the store the last one burned.
 

@@ -29,7 +29,7 @@ SPAWN = json.dumps(
         "new_facts": [
             {"entity_id": "person:you", "key": "name", "value": "Marcus Turner", "source": "invented", "visibility": "obvious"},
             {"entity_id": "person:you", "key": "age", "value": "28", "source": "invented", "visibility": "obvious"},
-            {"entity_id": "person:you", "key": "cash_usd", "value": 17.5, "source": "invented", "visibility": "hidden"},
+            {"entity_id": "person:you", "key": "cash_usd", "value": 17.5, "source": "invented", "visibility": "noticeable"},
             {"entity_id": "person:you", "key": "condition", "value": "feet aching after a double", "source": "invented", "visibility": "noticeable"},
             {"entity_id": "place:kitchen", "key": "smell", "value": "old frying oil", "source": "invented", "visibility": "obvious"},
         ],
@@ -42,7 +42,7 @@ SPAWN = json.dumps(
 def build(store, config, call_log, resolver_script, narrator_script):
     llm = FakeLLM(config, call_log, {"resolver": resolver_script, "narrator": narrator_script})
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
-    narrator = Narrator(llm, store, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
     return llm, resolver, narrator, Turn(store, resolver, narrator, random.Random(7))
 
 
@@ -62,7 +62,7 @@ def test_an_outcome_with_no_location_at_all_is_refused(store, config, call_log):
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, no_location, no_location], ["Oil ticks.", "x"]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     with pytest.raises(ModelCallFailed):
         turn.play("I walk to the nearest bar", life)
@@ -77,7 +77,7 @@ def test_a_location_that_does_not_exist_is_refused_with_an_explanation(
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, invented, invented], ["Oil ticks.", "x"]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     with pytest.raises(ModelCallFailed):
         turn.play("I walk to the nearest bar", life)
@@ -98,7 +98,7 @@ def test_the_retry_succeeds_when_the_second_try_creates_the_place(store, config,
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, bad, good], ["Oil ticks.", "The door swings shut."]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     turn.play("I walk to the nearest bar", life)
 
@@ -118,7 +118,7 @@ def test_the_player_ends_where_the_outcome_says_even_with_no_move_listed(
         store, config, call_log, [SPAWN, moved_by_location_alone],
         ["Oil ticks.", "Smoke and old beer."],
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     result = turn.play("I walk to the nearest bar", life)
 
@@ -135,7 +135,7 @@ def test_spending_money_that_was_never_settled_is_reported(store, config, call_l
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, phantom], ["Oil ticks.", "She shrugs."]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     result = turn.play("I settle my tab", life)
 
@@ -152,7 +152,7 @@ def test_a_delta_on_a_quantity_settled_this_same_turn_is_allowed(store, config, 
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, both_at_once], ["Oil ticks.", "She nods."]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     result = turn.play("I settle my tab", life)
 
@@ -171,10 +171,10 @@ def test_a_world_whose_spawn_failed_can_still_be_started(store, config, call_log
     )
 
     with pytest.raises(ModelCallFailed):
-        begin_life(store, resolver, narrator, config.spawn_city)
+        begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     # The two entities code creates are already there; begin_life must not choke.
-    life, opening = begin_life(store, resolver, narrator, config.spawn_city)
+    life, opening = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
     assert opening == "Oil ticks."
     assert life.character_id == PLAYER_ID
 
@@ -222,10 +222,10 @@ def test_the_narration_is_regenerated_once_when_it_speaks_for_you(
             "The bartender slides a glass across.",  # and its replacement
         ],
     )
-    begin_life(store, resolver, narrator, config.spawn_city)
+    begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
     call_log.records.clear()
 
-    result = narrator.narrate("I order a beer", [], [])
+    result = narrator.narrate("order a beer", [], [])
 
     assert result == "The bartender slides a glass across."
     assert len(call_log.records) == 2
@@ -242,9 +242,9 @@ def test_a_breach_that_survives_regeneration_is_recorded(store, config, call_log
             'You say it again, differently.',  # the model repeats itself
         ],
     )
-    begin_life(store, resolver, narrator, config.spawn_city)
+    begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
-    result = narrator.narrate("I order a beer", [], [])
+    result = narrator.narrate("order a beer", [], [])
 
     assert result == "You say it again, differently."
     assert narrator.breaches == ["You say survived a regeneration"]
@@ -255,9 +255,9 @@ def test_a_clean_regeneration_records_no_breach(store, config, call_log):
         store, config, call_log, [SPAWN],
         ["Oil ticks.", "You decide to leave.", "The door sticks, then gives."],
     )
-    begin_life(store, resolver, narrator, config.spawn_city)
+    begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
-    narrator.narrate("I leave", [], [])
+    narrator.narrate("leave", [], [])
 
     assert narrator.breaches == []
 
@@ -267,7 +267,7 @@ def test_the_resolver_hands_the_narrator_the_players_words(store, config, call_l
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, spoke], ["Oil ticks.", "She reaches for a glass."]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     turn.play("I order a beer", life)
 
@@ -281,7 +281,7 @@ def test_the_resolver_hands_the_narrator_the_players_words(store, config, call_l
 def test_the_opening_uses_its_own_prompt(store, config, call_log):
     llm, resolver, narrator, _ = build(store, config, call_log, [SPAWN], ["Oil ticks."])
 
-    begin_life(store, resolver, narrator, config.spawn_city)
+    begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     opening_system = [s for role, s, u in llm.prompts if role == "narrator"][0]
     assert "first words of a life" in opening_system
@@ -291,7 +291,7 @@ def test_the_opening_uses_its_own_prompt(store, config, call_log):
 def test_the_opening_never_sees_the_biography(store, config, call_log):
     llm, resolver, narrator, _ = build(store, config, call_log, [SPAWN], ["Oil ticks."])
 
-    begin_life(store, resolver, narrator, config.spawn_city)
+    begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     opening_user = [u for role, s, u in llm.prompts if role == "narrator"][0]
     for recited in ("Marcus Turner", "17.5", '"age"', '"job"'):
@@ -306,10 +306,83 @@ def test_later_turns_do_see_the_biography_again(store, config, call_log):
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, plain], ["Oil ticks.", "The pit is backed up."]
     )
-    life, _ = begin_life(store, resolver, narrator, config.spawn_city)
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     turn.play("I look at my hands", life)
 
     later = [u for role, s, u in llm.prompts if role == "narrator"][-1]
     assert "Marcus Turner" in later
     assert BIOGRAPHY  # the omission set is only applied to the opening
+
+
+# ---- the detector has to be precise, not just sensitive ----
+#
+# Every false positive spends a second narrator call and risks trading good
+# narration for worse, so a "you <verb>" inside someone else's clause is not a
+# breach: the verb belongs to the speaker, not to the narrator.
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Gary asks what you want.",
+        "He repeats what you told him, slower this time.",
+        "She looks like she knows what you think of the place.",
+        "The bartender sets the glass down and asks if you want another.",
+        "He remembers you asked about the car.",
+        "Marisol says she heard you were back in town.",
+    ],
+)
+def test_someone_else_talking_about_you_is_not_a_breach(line):
+    assert narrated_the_player(line) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "You say you will have a beer.",
+        "The door closes. You decide to wait.",
+        "He nods, and you tell him about the money.",
+        "After a long moment you admit it.",
+        "She waits; you say nothing.",
+    ],
+)
+def test_the_narrator_speaking_for_you_still_is(line):
+    assert narrated_the_player(line)
+
+
+def test_the_narrator_is_never_given_the_players_own_words(store, config, call_log):
+    """Defect 2, closed structurally instead of policed afterwards.
+
+    The narrator used to receive the raw typed text, and run B read it straight
+    back as "You say you'll have a beer, please" — twice, through a
+    regeneration. It gets the resolver's one-line intent now, so the phrasing
+    it was echoing is not in the prompt at all.
+    """
+    said = "I lean over and tell her the money is coming on Friday, I swear"
+    turn_reply = reply(
+        intent="promise the bartender the money on Friday",
+        player_location="place:bar",
+        summary="you make a promise",
+        you_said_aloud="promises the money by Friday",
+        dialogue=[{"speaker_id": "person:marisol", "gist": "she has heard that before"}],
+    )
+    llm = FakeLLM(
+        config, call_log,
+        {"resolver": [SPAWN, turn_reply], "narrator": ["Quiet.", "She doesn't look up from the glass."]},
+    )
+    resolver = Resolver(llm, store, config, PROMPTS_DIR)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    turn = Turn(store, resolver, narrator, random.Random(7))
+    life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
+    store.add_entity("place:bar", "place", "The Peanut", location_id="place:spawn-city")
+
+    turn.play(said, life)
+
+    narrator_prompts = [user for role, _, user in llm.prompts if role == "narrator"]
+    assert narrator_prompts
+    for prompt in narrator_prompts:
+        assert "I swear" not in prompt
+        assert said not in prompt
+    # The resolver's reading of it does get through, so a question still lands.
+    assert "promise the bartender the money on Friday" in narrator_prompts[-1]

@@ -18,9 +18,11 @@ sheet.py.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
 
 SOURCES = frozenset({"real-data", "world-knowledge", "invented"})
 VISIBILITIES = frozenset({"obvious", "noticeable", "hidden"})
@@ -171,7 +173,13 @@ class Store:
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
+        # A turn writes a few dozen rows and each one used to be its own fsync.
+        # WAL plus synchronous=NORMAL keeps a crash from tearing a committed
+        # turn while taking that cost off the path the player waits on.
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.executescript(SCHEMA)
+        self._open_transactions = 0
         if self.db.execute("SELECT 1 FROM clock WHERE id = 1").fetchone() is None:
             start = starts_at or datetime.now(timezone.utc)
             self.db.execute("INSERT INTO clock (id, now) VALUES (1, ?)", (_iso(start),))
@@ -179,6 +187,37 @@ class Store:
 
     def close(self) -> None:
         self.db.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Commit everything written inside as one unit, or none of it.
+
+        Spec 1: every turn is resolve, commit, render. Without this a turn was
+        a few dozen separate commits, so a crash or a refused write partway
+        through could leave the clock advanced over a half-written world. Nests,
+        so the store's own methods still work when called directly.
+        """
+        if self._open_transactions:
+            self._open_transactions += 1
+            try:
+                yield
+            finally:
+                self._open_transactions -= 1
+            return
+        self._open_transactions = 1
+        try:
+            yield
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        finally:
+            self._open_transactions = 0
+
+    def _commit(self) -> None:
+        """Commit, unless a transaction() is holding the writes together."""
+        if not self._open_transactions:
+            self.db.commit()
 
     # ---- the clock (spec 6.1) ----
 
@@ -191,7 +230,7 @@ class Store:
             raise ClockWentBackward(f"cannot advance the clock by {minutes} minutes")
         moment = self.now() + timedelta(minutes=minutes)
         self.db.execute("UPDATE clock SET now = ? WHERE id = 1", (_iso(moment),))
-        self.db.commit()
+        self._commit()
         return moment
 
     # ---- entities (spec 2.1) ----
@@ -213,7 +252,7 @@ class Store:
             # Everything the store refuses is a StoreError, so callers that are
             # draining model output only ever have to catch one thing.
             raise StoreError(f"cannot add entity {entity_id!r}: {exc}") from exc
-        self.db.commit()
+        self._commit()
         return Entity(entity_id, kind, name, location_id)
 
     def entity(self, entity_id: str) -> Entity | None:
@@ -234,7 +273,7 @@ class Store:
         self.db.execute(
             "UPDATE entities SET location_id = ? WHERE id = ?", (location_id, entity_id)
         )
-        self.db.commit()
+        self._commit()
 
     def contents(self, location_id: str) -> list[Entity]:
         """What is here. Used to decide who is present and what is carried."""
@@ -320,7 +359,8 @@ class Store:
         self.db.execute(
             "UPDATE facts SET superseded_by = ? WHERE id = ?", (new.id, old.id)
         )
-        self.db.commit()
+        self._carry_self_knowledge(old, new)
+        self._commit()
         return new
 
     def apply_delta(self, entity_id: str, key: str, delta: float, cause: str) -> float:
@@ -339,8 +379,33 @@ class Store:
         self.db.execute(
             "UPDATE facts SET superseded_by = ? WHERE id = ?", (new.id, old.id)
         )
-        self.db.commit()
+        self._carry_self_knowledge(old, new)
+        self._commit()
         return total
+
+    def _carry_self_knowledge(self, old: Fact, new: Fact) -> None:
+        """Move the subject's own knowledge onto the fact that replaced it.
+
+        A knowledge row used to point at a fact forever, so a player who had
+        learned `cash_usd = 41` still believed 41 after spending six of it: the
+        narrator and the sheet were handed a superseded number, which undoes
+        what rule 4 is for.
+
+        Only the subject's own row moves, and only when it holds no divergent
+        belief. The narrowness is the point. You are present for every change to
+        your own cash and your own injuries, so you know them; you are not
+        present when your landlord changes the lock, and spec 6.5 wants you to
+        find that out by putting a key in it. A row that holds a belief is a
+        snapshot of what someone was told, so it never moves — that is where
+        lies and stale rumours live.
+        """
+        self.db.execute(
+            "INSERT OR IGNORE INTO knowledge (mind_id, fact_id, learned_at, how)"
+            " SELECT mind_id, ?, ?, how FROM knowledge"
+            " WHERE fact_id = ? AND mind_id = ?"
+            "   AND belief_text IS NULL AND belief_num IS NULL",
+            (new.id, _iso(self.now()), old.id, old.entity_id),
+        )
 
     def _insert(
         self,
@@ -366,7 +431,7 @@ class Store:
                 _iso(self.now()),
             ),
         )
-        self.db.commit()
+        self._commit()
         return self.fact(cursor.lastrowid)
 
     def fact(self, fact_id: int) -> Fact:
@@ -398,14 +463,27 @@ class Store:
                 float(belief) if numeric else None,
             ),
         )
-        self.db.commit()
+        self._commit()
 
     def known(self, mind_id: str) -> list[Known]:
-        """Everything this mind holds. The narrator sees only this (rule 5)."""
+        """Everything this mind holds, one belief per fact key (rule 5).
+
+        A mind can end up holding two rows for the same key — it learned the
+        old fact and then learned the one that superseded it — and the latest
+        is the one it believes. Without the dedupe the narrator was handed both
+        the old cash and the new. A row pointing at a superseded fact survives
+        on its own, though: that is a mind still believing the lock is the lock
+        it last saw.
+        """
         rows = self.db.execute(
             "SELECT k.learned_at, k.how, k.belief_text, k.belief_num, f.*"
             " FROM knowledge k JOIN facts f ON f.id = k.fact_id"
-            " WHERE k.mind_id = ? ORDER BY k.id",
+            " WHERE k.mind_id = ? AND k.id = ("
+            "     SELECT MAX(k2.id) FROM knowledge k2"
+            "     JOIN facts f2 ON f2.id = k2.fact_id"
+            "     WHERE k2.mind_id = k.mind_id"
+            "       AND f2.entity_id = f.entity_id AND f2.key = f.key"
+            " ) ORDER BY k.id",
             (mind_id,),
         ).fetchall()
         known = []
@@ -428,7 +506,7 @@ class Store:
             "INSERT INTO lives (character_id, started_at) VALUES (?, ?)",
             (character_id, _iso(self.now())),
         )
-        self.db.commit()
+        self._commit()
         return self.life(cursor.lastrowid)
 
     def end_life(self, life_id: int, ending: str) -> None:
@@ -437,7 +515,7 @@ class Store:
             "UPDATE lives SET ended_at = ?, ending = ? WHERE id = ?",
             (_iso(self.now()), ending, life_id),
         )
-        self.db.commit()
+        self._commit()
 
     def life(self, life_id: int) -> Life:
         row = self.db.execute("SELECT * FROM lives WHERE id = ?", (life_id,)).fetchone()
@@ -472,7 +550,7 @@ class Store:
             " narration) VALUES (?, ?, ?, ?, ?, ?)",
             (life_id, _iso(self.now()), player_said, intent, roll_json, narration),
         )
-        self.db.commit()
+        self._commit()
         return cursor.lastrowid
 
     def recent_turns(self, life_id: int, limit: int) -> list[sqlite3.Row]:
