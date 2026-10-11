@@ -49,14 +49,15 @@ class OrderTrackingLLM(FakeLLM):
         self.events: list[str] = []
 
     def _raw_stream(self, role, model, system, user):
-        for chunk in super()._raw_stream(role, model, system, user):
-            self.events.append("chunk")
-            yield chunk
-
-    def _raw(self, role, model, system, user):
+        # The narrator streams now too, so which role a chunk belongs to is
+        # what distinguishes "the resolver is still writing" from "the voice
+        # has started".
         if role == "narrator":
             self.events.append("narrate")
-        return super()._raw(role, model, system, user)
+        for chunk in super()._raw_stream(role, model, system, user):
+            if role == "resolver":
+                self.events.append("chunk")
+            yield chunk
 
 
 # ---- the splitter ----
@@ -84,10 +85,14 @@ def test_an_unfinished_object_is_not_split():
 
 
 def test_the_narrator_runs_before_the_stream_has_finished(store, config, call_log):
+    # The opening has to settle something the character notices, or there is no
+    # first beat to fire mid-stream — a turn that perceives nothing falls back
+    # to one narration after the whole call, which is what this guards against.
     turn_reply = reply(
         {"deltas": [{"entity_id": "person:you", "key": "cash_usd", "delta": -5}]},
         player_location="place:kitchen",
         summary="you pay",
+        new_facts=[["place:kitchen", "ticket_rail", "three tickets deep"]],
     )
     llm = OrderTrackingLLM(
         config, call_log, {"resolver": [SPAWN, turn_reply], "narrator": ["Oil ticks.", "Coins on the counter."]}
@@ -181,7 +186,7 @@ def test_prose_instead_of_json_fails_cleanly(store, config, call_log):
 
 
 def test_the_llm_layer_raises_ledger_failed_distinctly(store, config, call_log):
-    """stream_pair cannot retry a bad ledger: the scene is already committed.
+    """stream_objects cannot retry a bad ledger: the scene is committed.
 
     turn.play catches this and keeps the narration — see
     test_an_unusable_ledger_still_delivers_the_narration — but the distinction

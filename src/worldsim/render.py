@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Callable
 
 from .budget import as_prompt, estimate_tokens, take_within
 from .config import Config
-from .llm import _BaseLLM
+from .llm import StopNarration, _BaseLLM
 from .resolve import PLAYER_ID, Line
 from .store import Entity, Known, Store
 
@@ -69,6 +70,34 @@ CORRECTION = (
 )
 
 
+# A sentence ends at .?! followed by a space or the end of the text. The decimal
+# in "$18.50" and the dot in "Mr." do not end one, so a terminator has to be
+# followed by whitespace and then something that starts a sentence.
+SENTENCE_END = re.compile(r'(?<=[.!?])["\')\]]*\s+(?=[A-Z"\'(—])')
+
+# "Mr. Brackett" would otherwise be two sentences, which a voice would read with
+# a pause in the wrong place.
+ABBREVIATIONS = frozenset(
+    {"mr", "mrs", "ms", "dr", "st", "jr", "sr", "lt", "sgt", "capt", "no", "vs"}
+)
+
+
+def _split_sentence(buffer: str) -> tuple[str | None, str]:
+    """The first complete sentence in `buffer`, and what is left after it.
+
+    Sentence granularity is what TTS wants anyway: a clause carries its own
+    prosody, where a word-by-word feed does not. Returns (None, buffer) until a
+    whole one has arrived.
+    """
+    for match in SENTENCE_END.finditer(buffer):
+        head = buffer[: match.start()]
+        last = WORDS.findall(head)
+        if last and head.endswith(".") and last[-1].lower() in ABBREVIATIONS:
+            continue
+        return head.strip(), buffer[match.end() :]
+    return None, buffer
+
+
 def narrated_the_player(text: str) -> list[str]:
     """Phrases that put words or thoughts in the player's mouth."""
     found = []
@@ -100,6 +129,7 @@ class Narrator:
         noticed_fact_ids: list[int],
         said_aloud: str | None = None,
         omit_keys: frozenset[str] = frozenset(),
+        already_said: str | None = None,
         budget_tokens: int | None = None,
     ) -> dict:
         """What the narrator is allowed to see. Nothing else reaches it.
@@ -133,6 +163,10 @@ class Narrator:
             # cannot echo what it was never given, and `intent` still carries
             # any question that needs answering.
             "you_intended": intent,
+            # A turn lands in two beats: the room, then the person in it. The
+            # second narrator call is told what the first already said so it
+            # carries on instead of describing the place twice.
+            "already_told_you": already_said,
             # Also already decided by the resolver, so the narrator never has
             # to invent speech for the player.
             "you_said_aloud": said_aloud,
@@ -227,8 +261,19 @@ class Narrator:
         said_aloud: str | None = None,
         prompt_name: str = "narrator.md",
         omit_keys: frozenset[str] = frozenset(),
+        already_said: str | None = None,
+        on_text: Callable[[str], None] | None = None,
     ) -> str:
-        """Narrate, and regenerate once if it narrated the player (defect 2)."""
+        """Narrate, streamed a sentence at a time, and gated on the contract.
+
+        `on_text` receives each sentence as it is cleared, so speech can start
+        before the last one is written. Nothing reaches it unchecked: a breach
+        in the first sentence means nothing has gone out yet, so the whole
+        narration is regenerated as before (defect 2). A breach later means the
+        earlier sentences are already spoken, so the narration simply stops
+        there — truncating is allowed, and "stop when the world stops" is the
+        contract anyway. Taking words back is not.
+        """
         system = (self.prompts_dir / prompt_name).read_text()
         user = as_prompt(
             self.context(
@@ -237,26 +282,87 @@ class Narrator:
                 noticed_fact_ids,
                 said_aloud,
                 omit_keys,
+                already_said,
                 # The instructions are the first claim on the budget (spec 5.2).
                 budget_tokens=self.config.token_budgets["narrator"]
                 - estimate_tokens(system),
             )
         )
 
-        first = self.llm.text("narrator", system, user)
-        broke = narrated_the_player(first)
-        if not broke:
-            return first
+        accepted, broke_first = self._speak(system, user, on_text)
+        if not broke_first:
+            return accepted
 
-        # One regeneration only: a still-imperfect line beats no narration.
-        second = self.llm.text(
-            "narrator",
-            system,
-            user + CORRECTION.format(found=", ".join(sorted(set(broke)))),
-        )
-        still = narrated_the_player(second)
-        if still:
+        # Nothing was delivered, so one regeneration is still safe. This one is
+        # ungated: a still-imperfect line beats no narration at all, and
+        # blocking it a second time would leave the player in silence.
+        retry = user + CORRECTION.format(found=", ".join(sorted(set(broke_first))))
+        accepted, broke_again = self._speak(system, retry, on_text, gate=False)
+        if broke_again:
             self.breaches.append(
-                f"{', '.join(sorted(set(still)))} survived a regeneration"
+                f"{', '.join(sorted(set(broke_again)))} survived a regeneration"
             )
-        return second
+        return accepted
+
+    def _speak(
+        self,
+        system: str,
+        user: str,
+        on_text: Callable[[str], None] | None,
+        gate: bool = True,
+    ) -> tuple[str, list[str]]:
+        """Stream one narration, clearing it a sentence at a time.
+
+        Returns what was accepted, and the breach that stopped it only when it
+        happened before anything was delivered — which is the one case the
+        caller can still do something about. With `gate=False` every sentence
+        goes out and the breach is only reported.
+        """
+        buffer = ""
+        accepted: list[str] = []
+        blocked: list[str] = []
+        stopped = False
+
+        def take(chunk: str) -> None:
+            nonlocal buffer, stopped
+            buffer += chunk
+            while True:
+                sentence, rest = _split_sentence(buffer)
+                if sentence is None:
+                    return
+                buffer = rest
+                broke = narrated_the_player(sentence)
+                if broke:
+                    blocked.extend(broke)
+                    if gate:
+                        stopped = True
+                        raise StopNarration
+                accepted.append(sentence)
+                if on_text is not None:
+                    on_text(sentence)
+
+        self.llm.stream_text("narrator", system, user, take)
+        # A flag rather than catching StopNarration here: stream_text swallows
+        # it, so the exception never reaches this frame, and the half-sentence
+        # left in the buffer when it fired was being accepted as narration.
+        if not stopped:
+            # Whatever is left has no terminator; it is still a sentence.
+            tail = buffer.strip()
+            if tail:
+                broke = narrated_the_player(tail)
+                if broke:
+                    blocked.extend(broke)
+                if not broke or not gate:
+                    accepted.append(tail)
+                    if on_text is not None:
+                        on_text(tail)
+
+        text = " ".join(accepted)
+        # A breach once something is already out is recorded, not retried:
+        # there is no taking back a sentence the player has heard.
+        if gate and blocked and accepted:
+            self.breaches.append(
+                f"{', '.join(sorted(set(blocked)))} cut the narration short"
+            )
+            return text, []
+        return text, blocked

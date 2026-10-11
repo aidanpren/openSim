@@ -159,7 +159,9 @@ def test_the_committed_outcome_matches_the_branch_the_roll_picked(store, config,
     expected_success = expected_roll < 0.5
 
     llm, resolver, narrator, turn = build(
-        store, config, call_log, [SPAWN, RISKY_TURN], ["Quiet.", "The door chimes."], seed=seed
+        store, config, call_log, [SPAWN, RISKY_TURN],
+        ["Quiet.", "Marisol is half watching the television.", "The door chimes."],
+        seed=seed,
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
@@ -182,7 +184,8 @@ def test_the_committed_outcome_matches_the_branch_the_roll_picked(store, config,
 
 def test_the_roll_is_logged_with_odds_both_outcomes_and_the_result(store, config, call_log):
     llm, resolver, narrator, turn = build(
-        store, config, call_log, [SPAWN, RISKY_TURN], ["Quiet.", "The door chimes."]
+        store, config, call_log, [SPAWN, RISKY_TURN],
+        ["Quiet.", "Marisol is half watching the television.", "The door chimes."],
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
     turn.play("I pocket the whiskey", life)
@@ -195,7 +198,8 @@ def test_the_roll_is_logged_with_odds_both_outcomes_and_the_result(store, config
 
 def test_the_narration_never_mentions_the_roll(store, config, call_log):
     llm, resolver, narrator, turn = build(
-        store, config, call_log, [SPAWN, RISKY_TURN], ["Quiet.", "The door chimes behind you."]
+        store, config, call_log, [SPAWN, RISKY_TURN],
+        ["Quiet.", "Marisol is half watching the television.", "The door chimes behind you."]
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
     turn.play("I pocket the whiskey", life)

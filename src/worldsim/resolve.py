@@ -212,21 +212,39 @@ class Roll(BaseModel):
     on_failure: Outcome
 
 
-class Scene(BaseModel):
-    """The first of two objects the resolver emits.
+class Opening(BaseModel):
+    """The first of three objects, and the only one the player waits on.
 
-    Everything the narrator needs and nothing else, so narration can start
-    while the ledger is still being written. Field order matters: the model
-    emits them in roughly this order, and the sooner the last one lands the
-    sooner the player hears something.
+    Where the character ends up, how long it took, and the two or three things
+    they register first. Nothing else — every token in here is a second of
+    silence. Measured across six streamed calls, the first object was 68-83% of
+    the whole resolver call, so this is the one piece of output that decides
+    time-to-first-word.
+
+    Field order matters: the model emits them in roughly this order, and the
+    sooner the last one lands the sooner the player hears something.
     """
 
     intent: str
     duration_minutes: float = Field(ge=0)
     player_location: str
-    # True when a roll decides the turn. Narration then waits for the ledger,
-    # because which branch happened is not known until code rolls.
+    # True when a roll decides the turn. The opening then holds only what is
+    # true either way, and the outcome is narrated once code has rolled.
     uncertain: bool = False
+    new_entities: list[NewEntity] = Field(default_factory=list)
+    new_facts: list[NewFact] = Field(default_factory=list)
+    perceived: list[Perceived] = Field(default_factory=list)
+
+
+class Scene(BaseModel):
+    """The second object: the rest of the truth, and who said what.
+
+    Committed and narrated as a second beat, while the ledger is still being
+    written. Anything in here that the character perceives reaches them a
+    moment after the opening did, which is also how a room actually lands —
+    the place first, then the person in it.
+    """
+
     summary: str
     you_said_aloud: str | None = None
     new_entities: list[NewEntity] = Field(default_factory=list)
@@ -318,9 +336,9 @@ class Resolver:
         self,
         player_said: str,
         recent: list[str],
-        on_scene: Callable[[Scene], None],
-    ) -> tuple[Scene, Ledger]:
-        """Stream one call. `on_scene` fires the moment the scene is valid."""
+        on_object: Callable[[int, object], None],
+    ) -> tuple[Opening, Scene, Ledger]:
+        """Stream one call. `on_object` fires as each of the three is valid."""
         # Spec 5.2's priority order: the instructions have the first claim on
         # the budget, then what the player just said, then the facts where they
         # are standing, then the scene so far. So the oldest turn is what goes
@@ -343,38 +361,41 @@ class Resolver:
         while estimate_tokens(payload) > budget and payload["recent_turns"]:
             payload["recent_turns"].pop(0)
         user = as_prompt(payload)
-        return self.llm.stream_pair(
+        opening, scene, ledger = self.llm.stream_objects(
             "resolver",
             system,
             user,
-            Scene,
-            Ledger,
-            on_scene,
-            self.check_scene,
+            (Opening, Scene, Ledger),
+            on_object,
+            (self.check_opening, None, None),
         )
+        return opening, scene, ledger
 
-    def check_scene(self, scene: Scene) -> None:
-        """Checks the schema can't make, run before the scene is committed.
+    def check_opening(self, opening: Opening) -> None:
+        """Checks the schema can't make, run before anything is committed.
 
         Raising here spends the one retry (spec 3.3) with the reason attached,
         which is the only way the model learns it proposed an incoherent world.
-        The ledger cannot be checked this way: by the time it arrives the scene
-        is already committed and narrated, so its problems are reported as
-        dropped writes instead.
+        Only the opening can be checked this way: by the time the objects after
+        it arrive it is already committed and narrated, so their problems are
+        reported as dropped writes instead.
         """
-        will_exist = {e.id for e in scene.new_entities}
-        where = scene.player_location
+        will_exist = {e.id for e in opening.new_entities}
+        where = opening.player_location
         if self.store.entity(where) is None and where not in will_exist:
             raise ValueError(
                 f"player_location is {where!r}, which does not exist and is not "
-                "created in this scene. Add it to new_entities, nested inside a "
-                "place that does exist."
+                "created in this opening. Add it to new_entities, nested inside "
+                "a place that does exist."
             )
 
-    def check_deltas(self, ledger: Ledger, scene: Scene) -> list[str]:
+    def check_deltas(self, ledger: Ledger, *settled_in: object) -> list[str]:
         """Deltas that cannot be applied, for the dev view and the log."""
         settled = {
-            (f.entity_id, f.key) for f in scene.new_facts if is_quantity(f.key)
+            (f.entity_id, f.key)
+            for obj in settled_in
+            for f in getattr(obj, "new_facts", ())
+            if is_quantity(f.key)
         }
         problems = []
         for delta in ledger.deltas:

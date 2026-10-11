@@ -29,6 +29,14 @@ decided. It is context, and the answer to a question they asked is in what they
 perceived, not in that line. You are never given their own words, so there is
 nothing to read back.
 
+## When you are continuing
+
+A turn can reach the player in two beats, because the world settles the room
+before it settles the people in it. When `already_told_you` is set, that has
+already been spoken aloud. Carry on from it in one or two sentences: do not
+repeat it, do not re-describe the place it covered, and do not open by
+summarising it. Say only what is new.
+
 ## Speech
 
 `you_said_aloud` tells you the substance of what the player said. It is there so

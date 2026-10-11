@@ -256,13 +256,71 @@ extremes are edge cases at 4% and 6%. `spawn.md` is told the station is a
 constraint rather than a mood, and that destitute-and-friendless is one life in
 twenty-five, not the default.
 
+## Latency, re-measured and rebuilt
+
+The 9.4s figure above decomposes badly, and two earlier readings of it were
+wrong. The honest version, from the 86 records in `logs/calls.jsonl`:
+
+- **The first object is 68-83% of the resolver call**, in 6 of 6 streamed calls.
+  That ratio is within-call, so it needs no fitting and it is the one solid
+  number here.
+- **The tail after it is only 2-3s.** Narration is ~48 output tokens, about
+  fourteen seconds of speech. Once the voice starts, the rest of the turn
+  finishes underneath it with time to spare.
+- **Prefill cannot be separated from generation with this data.** Throughput of
+  the same model varied 19.7-33.9 tok/s across six calls; a two-parameter fit
+  returns nonsense (TTFT of -14s). Both of the decompositions attempted before
+  this were unfounded.
+
+So: time-to-first-word is the only number that matters, and the engine now
+minimises how little must exist before someone speaks.
+
+**The resolver emits three objects, not two.** `Opening` carries the location,
+the duration and the two or three facts the character registers first — about
+sixty tokens. `Scene` carries everyone else in the room and what they say.
+`Ledger` is unchanged. Each commits before the beat that speaks it, so rule 1
+holds. On the worked example the first object fell to 46% of the reply.
+
+**A turn lands in two narration beats:** the room, then the person in it. The
+second call is given `already_told_you` so it carries on rather than describing
+the place twice, and it is skipped entirely when the scene adds nothing
+perceivable. A risky turn now speaks the approach — what is true either way —
+before code rolls, where it used to sit silent for the whole call.
+
+**Narration streams, gated a sentence at a time.** A breach in the first
+sentence means nothing has gone out, so it regenerates as before. A breach
+later means the earlier sentences are already spoken, so it truncates and the
+breach is recorded: "stop when the world stops" is the contract, and taking
+words back is not possible. `__main__.speak` is the seam streaming TTS needs.
+
+**`perceived` is mostly gone from the wire.** An `obvious` fact about the
+character, their room, or something in it with them is perceived by code — that
+is what `obvious` means — so the array carries only the `noticeable` and
+`hidden` exceptions.
+
+**The instructions are the input.** `resolver.md` was 1,895 tokens of a
+2,512-token input: the system prompt is ~88% of what the resolver prefills every
+turn. Documenting the third object pushed it to 2,204 before it was compressed
+back to 1,744, and `test_latency.py` now holds a ceiling on every prompt file.
+
+**And it is measurable next time.** `CallRecord` gains `ttft_seconds`,
+`object_seconds` and `object_tokens`, so one live session settles
+prefill-versus-generation instead of another round of inference from six points.
+
 ### Still open
 
 - The **playtest** and **cost** boxes above need a live 30-turn session. Worth
-  watching for: whether the station actually changes the kind of life written,
-  or the model finds its way back to the line cook regardless.
-- Latency: the agreed lever is compacting what a fact costs, measured live.
-  Target is ~135 tokens for the scene.
+  watching for: whether the station actually changes the kind of life written;
+  whether two beats read better or worse than one block; and what
+  `ttft_seconds` says, which decides whether the next lever is input tokens or
+  output tokens.
+- Unexplored and cheap if prefill dominates: prompt caching on the ~1,744-token
+  system prompt, and provider routing by throughput. Latency is not about
+  parameter count — the 70B was slower than the 405B — so provider is the
+  variable that has never been varied.
+- The question fast-path: an input that settles nothing ("what's on the
+  shelves?") needs no resolver at all. Probably the largest remaining average
+  win, and it needs routing that does not cost a call of its own.
 - `scene_change` is parsed and still read by nothing, as planned for M2.
 
 ### Decided, not outstanding

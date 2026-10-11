@@ -73,7 +73,17 @@ Each turn, the resolver decides which facts the player character notices, based 
 
 ### 3.1 Resolver output
 
-The resolver returns JSON, validated with pydantic, containing:
+The resolver streams **three JSON objects back to back**, each validated with pydantic and committed as it closes, because the player waits only on the first.
+
+1. **Opening** — where the character ends up, `duration_minutes`, `intent`, `uncertain`, and the two or three facts they register first. Roughly sixty tokens. This is the whole of what has to exist before anyone speaks.
+2. **Scene** — the rest of the truth: who else is present, what they look like, `dialogue`, `you_said_aloud`, `summary`, `scene_change`. Narrated as a second beat, which is also how a room lands: the place, then the person in it.
+3. **Ledger** — what the character does not perceive now: superseding facts, quantity deltas, moves, other people's knowledge, `ends_life`, and the roll.
+
+Each object commits before the beat that speaks it, so rule 1 holds throughout. Retries work on one boundary: until the opening is handed over nothing is committed, so a bad reply spends the spec 3.3 retry. After that there is no going back, and a malformed tail is reported as lost writes rather than replayed.
+
+An `obvious` fact about the character, the place they are in, or something in it with them is perceived by code — that is what `obvious` means — so `perceived` carries only the `noticeable` and `hidden` exceptions.
+
+Taken together the objects contain:
 
 - `intent`: what the player is attempting, in one line
 - `duration`: how much world time the action takes
@@ -285,9 +295,13 @@ Rough cost per turn at the play defaults, before OpenRouter's fee on credit purc
 | Background jobs, spread across turns | | | ~0.1¢ |
 | **Total** | | | **~1¢ per turn, roughly 30–35¢ per 30-minute session** |
 
-**Rule:** Every model call logs its role, model, input and output tokens, cost, and latency to `logs/`. Targets: an average under 2¢ per turn, and under 4 seconds to the first narrated word.
+**Rule:** Every model call logs its role, model, input and output tokens, cost, and latency to `logs/`. Latency is logged as time to the first token, time to each streamed object, and total, because those are three different problems. Targets: an average under 2¢ per turn, and under 4 seconds to the first narrated word.
 
-Narration streams, so speech can start before the sentence ends. Compaction and the director run after the narration is delivered, never before. Catch-up runs during commit, because the narration depends on it.
+Narration streams, a sentence at a time, so speech can start before the rest is written. Compaction and the director run after the narration is delivered, never before. Catch-up runs during commit, because the narration depends on it.
+
+Only time-to-first-word is worth optimising. A turn's narration is around 48 output tokens, which is about fourteen seconds of speech, against a two-to-three second tail after the first object closes: once the voice starts, the rest of the turn finishes underneath it. So the engine minimises how little has to exist before someone speaks, and lets total turn time be what it is.
+
+The resolver's instructions are most of what it has to prefill — 1,895 tokens of a 2,512-token input, measured — so the prompt files have a token ceiling, held by a test.
 
 ## 13. Interfaces
 

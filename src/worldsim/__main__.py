@@ -36,6 +36,16 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 COULD_NOT_RESOLVE = "Sorry, that didn't come through. Say it again?"
 
 
+def speak(sentence: str) -> None:
+    """Deliver one sentence the moment it clears the contract.
+
+    In text this only means it appears a beat earlier. It is here because it is
+    the seam voice needs: streaming text-to-speech takes a clause at a time, so
+    the first sentence can be spoken while the rest is still being written.
+    """
+    print(sentence, end=" ", flush=True)
+
+
 def latest_world(saves_dir: Path) -> Path | None:
     """The most recently played world, for resuming (build step 9)."""
     if not saves_dir.is_dir():
@@ -113,9 +123,17 @@ def dev_view(store: Store, resolver: Resolver, result: TurnResult | None, call_l
     lines.append(json.dumps(resolver.truth_here(), indent=2))
     for record in call_log.records[-3:]:
         timing = f"{record.seconds:.1f}s"
-        if record.scene_seconds is not None:
-            # What the player actually waited for, before the voice could start.
+        if record.object_seconds:
+            # What the player actually waited for, phase by phase. The first
+            # number is the one that matters: nothing is spoken before it.
+            phases = ", ".join(f"{s:.1f}s" for s in record.object_seconds)
+            timing = f"objects at {phases}; {record.seconds:.1f}s total"
+        elif record.scene_seconds is not None:
             timing = f"{record.scene_seconds:.1f}s to scene, {record.seconds:.1f}s total"
+        if record.ttft_seconds is not None:
+            # Prefill against generation. Six streamed calls could not separate
+            # these, which is why the lever was guesswork.
+            timing += f" (first token {record.ttft_seconds:.1f}s)"
         lines.append(
             f"call {record.role}/{record.model}: {record.input_tokens}+"
             f"{record.output_tokens} tok, {record.cost_cents:.3f}c, {timing}"
@@ -155,13 +173,13 @@ def main() -> int:
         print(f"A new life in {config.spawn_city}.\n")
         try:
             life, opening = begin_life(
-                store, resolver, narrator, config.spawn_city, rng
+                store, resolver, narrator, config.spawn_city, rng, on_text=speak
             )
         except (ModelCallFailed, StoreError) as exc:
             print(f"The world could not be started: {exc}", file=sys.stderr)
             store.close()
             return 1
-        print(opening)
+        print()
     else:
         past = store.recent_turns(life.id, limit=1)
         print(f"Back in it. {local_time(store)}.\n")
@@ -203,7 +221,7 @@ def main() -> int:
             continue
 
         try:
-            last = turn.play(said, life)
+            last = turn.play(said, life, on_text=speak)
         except LedgerFailed as exc:
             # The scene is already true and already narrated, so this is not a
             # "say it again" — part of the turn happened and some consequence
@@ -240,7 +258,7 @@ def main() -> int:
                 print(f"--- dev --- store refused the turn: {exc}")
             continue
 
-        print(f"\n{last.narration}\n")
+        print()  # the narration already went out, sentence by sentence
 
         if dev:
             print(dev_view(store, resolver, last, call_log))

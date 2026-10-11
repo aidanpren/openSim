@@ -12,16 +12,15 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from .config import OPENROUTER_BASE_URL, Config
 
 T = TypeVar("T", bound=BaseModel)
-S = TypeVar("S", bound=BaseModel)
 
 
 class ModelCallFailed(Exception):
@@ -34,6 +33,16 @@ class OutOfCredit(ModelCallFailed):
 
 class ProviderBusy(ModelCallFailed):
     """The provider's in-flight budget is exhausted. It clears on its own."""
+
+
+class StopNarration(Exception):
+    """Raised by a stream_text consumer that has heard enough.
+
+    The narrator is gated a sentence at a time, so a contract breach partway
+    through is caught before that sentence is spoken. There is no taking back
+    what has already gone out, so the rest of the generation is abandoned
+    instead of being regenerated.
+    """
 
 
 class LedgerFailed(ModelCallFailed):
@@ -69,6 +78,16 @@ class CallRecord:
     # How long until the narrator could start. This, not `seconds`, is what the
     # player actually waits for on a streamed resolver call.
     scene_seconds: float | None = None
+    # Time to the first content token. Six streamed calls in logs/calls.jsonl
+    # could not separate this from generation — the throughput of the same
+    # model varied from 19.7 to 33.9 tok/s between calls — so which of the two
+    # the player is actually waiting on was guesswork. It decides whether the
+    # lever is fewer input tokens or fewer output tokens, so it gets measured.
+    ttft_seconds: float | None = None
+    # Wall time and output tokens at the close of each JSON object in a
+    # multi-object stream, so the cost of each phase is readable afterwards.
+    object_seconds: list[float] | None = None
+    object_tokens: list[int] | None = None
 
 
 class CallLog:
@@ -99,18 +118,23 @@ RETRY_PREAMBLE = (
 class _Streamed:
     """How far one streamed attempt got. Owned by the caller of _stream_attempt.
 
-    `first` being set means the scene was valid and `on_first` has already run,
+    A non-empty `objects` means at least one object was valid and handed over,
     which is what tells the retry logic that the turn can no longer be replayed
-    from the top.
+    from the top: part of it is committed and the player has heard about it.
     """
 
-    first: Any = None
+    objects: list[Any] = field(default_factory=list)
     buffer: str = ""
-    json_start: int = 0
-    split_at: int = 0
+    cursor: int = 0  # where in the buffer the next object starts
     seconds: float = 0.0
-    scene_seconds: float | None = None
+    ttft: float | None = None
+    object_seconds: list[float] = field(default_factory=list)
+    object_tokens: list[int] = field(default_factory=list)
     error: Exception | str = "the reply contained no complete JSON object"
+
+    @property
+    def handed_over(self) -> bool:
+        return bool(self.objects)
 
 
 class _BaseLLM:
@@ -209,66 +233,79 @@ class _BaseLLM:
         model: str,
         system: str,
         user: str,
-        first_shape: type[T],
-        on_first: Callable[[T], None],
-        check: Callable[[T], None] | None,
+        shapes: Sequence[type[BaseModel]],
+        on_object: Callable[[int, Any], None],
+        checks: Sequence[Callable[[Any], None] | None],
     ) -> None:
         """One pass over the stream, writing its progress into `streamed`.
 
         `streamed` is the caller's, not a return value, because an exception
-        thrown after `on_first` has fired still has to leave behind the fact
-        that it fired: by then the scene is committed and spoken for.
+        thrown after an object has been handed over still has to leave behind
+        the fact that it was: by then part of the turn is committed and spoken
+        for, and the call can no longer be replayed from the top.
         """
         scanner: ObjectScanner | None = None
         started = time.monotonic()
         for chunk in self._raw_stream(role, model, system, user):
+            if streamed.ttft is None:
+                streamed.ttft = time.monotonic() - started
             streamed.buffer += chunk
             streamed.seconds = time.monotonic() - started
-            if streamed.first is not None:
-                continue  # the scene is away; just collect the ledger
-            if scanner is None:
-                start = json_start(streamed.buffer)
-                if start is None:
-                    continue
-                streamed.json_start = start
-                scanner = ObjectScanner(start)
-            end = scanner.feed(streamed.buffer)
-            if end is None:
-                continue
-            body = streamed.buffer[streamed.json_start : end]
-            try:
-                candidate = first_shape.model_validate_json(body)
-                if check is not None:
-                    check(candidate)
-            except (ValidationError, ValueError) as exc:
-                # Nothing is committed yet, so abandon the rest of the stream
-                # and spend the retry (spec 3.3) with the reason attached.
-                streamed.error = exc
-                return
-            streamed.first, streamed.split_at = candidate, end
-            streamed.scene_seconds = time.monotonic() - started
-            on_first(candidate)
+            # Every object is away; the rest of the stream is just the usage
+            # chunk the provider sends last.
+            while len(streamed.objects) < len(shapes):
+                if scanner is None:
+                    start = json_start(streamed.buffer[streamed.cursor :])
+                    if start is None:
+                        break
+                    streamed.cursor += start
+                    scanner = ObjectScanner()
+                end = scanner.feed(streamed.buffer[streamed.cursor :])
+                if end is None:
+                    break
+                index = len(streamed.objects)
+                body = streamed.buffer[streamed.cursor : streamed.cursor + end]
+                try:
+                    candidate = shapes[index].model_validate_json(body)
+                    check = checks[index] if index < len(checks) else None
+                    if check is not None:
+                        check(candidate)
+                except (ValidationError, ValueError) as exc:
+                    streamed.error = exc
+                    # Nothing handed over yet means nothing is committed, so the
+                    # whole call can be retried (spec 3.3) with the reason
+                    # attached. Otherwise the caller has to live with what it
+                    # already committed and narrated.
+                    return
+                streamed.cursor += end
+                scanner = None
+                streamed.object_seconds.append(time.monotonic() - started)
+                streamed.object_tokens.append(len(body) // 4)
+                streamed.objects.append(candidate)
+                on_object(index, candidate)
         streamed.seconds = time.monotonic() - started
 
-    def stream_pair(
+    def stream_objects(
         self,
         role: str,
         system: str,
         user: str,
-        first_shape: type[T],
-        second_shape: type[S],
-        on_first: Callable[[T], None],
-        check: Callable[[T], None] | None = None,
-    ) -> tuple[T, S]:
-        """Stream one call that emits two JSON objects, back to back.
+        shapes: Sequence[type[BaseModel]],
+        on_object: Callable[[int, Any], None],
+        checks: Sequence[Callable[[Any], None] | None] = (),
+    ) -> list[Any]:
+        """Stream one call that emits several JSON objects, back to back.
 
-        `on_first` runs the moment the first object is complete and valid,
-        while the second is still being generated. It is called at most once
-        and never with unvalidated output, so it is safe for it to commit.
+        `on_object(index, obj)` runs the moment each object is complete and
+        valid, while the ones after it are still being generated. It is never
+        called with unvalidated output, so it is safe for it to commit — which
+        is the whole point: the first object is small, so narration can start
+        on it seconds before the rest of the turn exists.
 
-        If the *second* object is invalid there is no going back — the first
-        has already been committed and narrated — so the caller is handed the
-        error rather than the whole turn being retried and double-committed.
+        Retries work on exactly one boundary. Until the first object is handed
+        over nothing is committed, so a bad reply spends the spec 3.3 retry.
+        After that there is no going back, and the caller is handed
+        `LedgerFailed` with whatever it already committed left standing.
         """
         # A stream can end with no complete object at all — truncated output, or
         # prose instead of JSON — so this must be bound before the retry reads it.
@@ -285,15 +322,14 @@ class _BaseLLM:
                 try:
                     self._stream_attempt(
                         streamed, role, model, system, user,
-                        first_shape, on_first, check,
+                        shapes, on_object, checks,
                     )
                 except Exception as exc:
-                    if streamed.first is not None:
-                        # The scene is already committed and narrated, so the
-                        # call cannot be replayed from the top.
+                    if streamed.handed_over:
                         self._log_stream(role, model, streamed, attempt)
                         raise LedgerFailed(
-                            f"{role} died after its scene was committed: {exc}"
+                            f"{role} died after {len(streamed.objects)} of "
+                            f"{len(shapes)} objects were committed: {exc}"
                         ) from exc
                     self._transport_failed(
                         exc, role, model, started, attempt, transport_try
@@ -302,51 +338,36 @@ class _BaseLLM:
                 break
 
             # Every attempt that reached the provider is logged, whether or not
-            # its scene survived validation (rule 9). A rejected one used to
-            # vanish, which hid the retry and under-reported the session spend.
+            # it survived validation (rule 9). A rejected one used to vanish,
+            # which hid the retry and under-reported the session spend.
             self._log_stream(role, model, streamed, attempt)
 
-            if streamed.first is None:
+            if not streamed.handed_over:
                 error = streamed.error
                 if attempt == 2:
-                    raise ModelCallFailed(f"{role} scene was unusable twice: {error}")
+                    raise ModelCallFailed(
+                        f"{role} output was unusable twice: {error}"
+                    )
                 continue
 
-            try:
-                return streamed.first, self._second_object(streamed, second_shape)
-            except (ValidationError, ValueError) as exc:
+            if len(streamed.objects) < len(shapes):
+                # Everything up to here is true and spoken, so this cannot be
+                # retried. Loud, because the missing tail carries the deltas.
                 raise LedgerFailed(
-                    f"{role} scene committed but its ledger was unusable: {exc}"
-                ) from exc
+                    f"{role} committed {len(streamed.objects)} of {len(shapes)} "
+                    f"objects, then stopped: {streamed.error}"
+                )
+            return streamed.objects
 
-        raise ModelCallFailed(f"{role} produced no scene")
-
-    @staticmethod
-    def _second_object(streamed: _Streamed, shape: type[S]) -> S:
-        """The ledger, found the same way the scene was.
-
-        Brace-scanning rather than parsing the whole remainder, because models
-        add a closing fence or a line of prose after the second object often
-        enough, and a lost ledger means wrong money.
-        """
-        rest = streamed.buffer[streamed.split_at :]
-        start = json_start(rest)
-        if start is None:
-            return shape.model_validate_json("{}")  # nothing followed the scene
-        end = ObjectScanner(start).feed(rest)
-        if end is None:
-            # Truncated, so there is no object to read. Let the shape decide
-            # whether an empty ledger is acceptable.
-            return shape.model_validate_json(rest[start:].strip() or "{}")
-        return shape.model_validate_json(rest[start:end])
+        raise ModelCallFailed(f"{role} produced nothing usable")
 
     def _log_stream(
         self, role: str, model: str, streamed: _Streamed, attempt: int
     ) -> None:
         # An abandoned stream never reaches the provider's usage chunk, so a
-        # rejected scene logs zero tokens. The record still has to exist: it is
-        # the only trace that the attempt happened and why it was thrown away.
-        usage = self._stream_usage if streamed.first is not None else (0, 0)
+        # rejected attempt logs zero tokens. The record still has to exist: it
+        # is the only trace that the attempt happened and why it was dropped.
+        usage = self._stream_usage if streamed.handed_over else (0, 0)
         price = self.config.price_for(model)
         self.call_log.write(
             CallRecord(
@@ -357,11 +378,64 @@ class _BaseLLM:
                 cost_cents=price.cents(*usage) if price else 0.0,
                 seconds=streamed.seconds,
                 attempt=attempt,
-                ok=streamed.first is not None,
-                error=None if streamed.first is not None else str(streamed.error),
-                scene_seconds=streamed.scene_seconds,
+                ok=streamed.handed_over,
+                error=None if streamed.handed_over else str(streamed.error),
+                # The first object is what the player waits on, so it keeps the
+                # name the dev view and the logs already use.
+                scene_seconds=(
+                    streamed.object_seconds[0] if streamed.object_seconds else None
+                ),
+                ttft_seconds=streamed.ttft,
+                object_seconds=streamed.object_seconds or None,
+                object_tokens=streamed.object_tokens or None,
             )
         )
+
+    def stream_text(
+        self, role: str, system: str, user: str, on_chunk: Callable[[str], None]
+    ) -> str:
+        """A prose call delivered as it is written. Returns the whole of it.
+
+        The narrator used to block until its last token, which put its entire
+        call between the player and the first word. `on_chunk` may raise
+        `StopNarration` to abandon the rest.
+        """
+        model = self.config.model_for(role)
+        for transport_try in (1, 2):
+            started = time.monotonic()
+            text = ""
+            ttft = None
+            self._stream_usage = (0, 0)
+            try:
+                for chunk in self._raw_stream(role, model, system, user):
+                    if ttft is None:
+                        ttft = time.monotonic() - started
+                    text += chunk
+                    on_chunk(chunk)
+            except StopNarration:
+                pass  # the caller has what it wants; the rest is not needed
+            except Exception as exc:
+                self._transport_failed(
+                    exc, role, model, started, 1, transport_try
+                )
+                continue
+            usage = self._stream_usage
+            price = self.config.price_for(model)
+            self.call_log.write(
+                CallRecord(
+                    role=role,
+                    model=model,
+                    input_tokens=usage[0],
+                    output_tokens=usage[1],
+                    cost_cents=price.cents(*usage) if price else 0.0,
+                    seconds=time.monotonic() - started,
+                    attempt=1,
+                    ok=True,
+                    ttft_seconds=ttft,
+                )
+            )
+            return text
+        raise ModelCallFailed(f"{role} call failed")
 
     def json(
         self,
