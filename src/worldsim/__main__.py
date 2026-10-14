@@ -92,6 +92,19 @@ def log_failure(config, player_said: str, exc: Exception) -> None:
         f.write(f"{datetime.now(timezone.utc).isoformat()}\t{player_said}\t{exc}\n")
 
 
+def _state_now(store: Store) -> dict:
+    """Transient state for the player and whoever is in the room (spec 2.1)."""
+    player = store.entity(PLAYER_ID)
+    here = player.location_id if player else None
+    nearby = [e.id for e in store.contents(here)] if here else []
+    out = {}
+    for entity_id in [PLAYER_ID] + nearby:
+        held = {s.key: s.value for s in store.state(entity_id)}
+        if held:
+            out[entity_id] = held
+    return out
+
+
 def dev_view(
     store: Store,
     resolver: Resolver,
@@ -107,21 +120,43 @@ def dev_view(
         lines.append(f"voice: {len(voice.failures)} failures")
         lines.extend(f"  {item}" for item in voice.failures[-3:])
     if result:
-        lines.append(f"intent: {result.intent}  ({result.duration_minutes} min)")
+        lines.append(
+            f"intent: {result.intent}  ({result.duration_minutes} min, "
+            f"read as {result.mode})"
+        )
         if result.roll:
             r = result.roll
             lines.append(
                 f"roll: p={r.p_success:.2f} rolled={r.rolled:.3f} -> "
                 f"{'success' if r.succeeded else 'failure'} ({r.why})"
             )
+            lines.append(f"  margin: {r.band}  {r.as_dice()}")
             lines.append(f"  on success: {r.on_success}")
             lines.append(f"  on failure: {r.on_failure}")
         else:
             lines.append("roll: none, the outcome was not in doubt")
         lines.append(f"perceived fact ids: {result.noticed_fact_ids}")
+        if result.fired:
+            # Transient state keeps no history, so this and the turn log are
+            # the only places a change to it is readable (spec 2.1).
+            lines.append("the clock fired:")
+            lines.extend(f"  {item}" for item in result.fired)
+        if result.changed_state:
+            lines.append("transient state changed:")
+            lines.extend(f"  {item}" for item in result.changed_state)
         if result.dropped:
             lines.append("dropped by validation:")
             lines.extend(f"  {item}" for item in result.dropped)
+    lines.append("state now:")
+    lines.append(json.dumps(_state_now(store), indent=2))
+    ahead = store.pending()
+    if ahead:
+        lines.append("timeline ahead:")
+        lines.extend(
+            f"  {e.at.isoformat()} {e.what}"
+            f"{' (reaches you)' if e.reaches_player else ''}"
+            for e in ahead
+        )
     lines.append("truth here:")
     lines.append(json.dumps(resolver.truth_here(), indent=2))
     for record in call_log.records[-3:]:
@@ -183,7 +218,8 @@ def main() -> int:
         voice.warm()
         try:
             life, opening = begin_life(
-                store, resolver, narrator, config.spawn_city, rng, on_text=speak
+                store, resolver, narrator, config.spawn_city, rng, on_text=speak,
+                premises_path=config.logs_dir / "premises.txt",
             )
         except (ModelCallFailed, StoreError) as exc:
             print(f"The world could not be started: {exc}", file=sys.stderr)
@@ -198,6 +234,10 @@ def main() -> int:
             print(past[0]["narration"])
 
     dev = False
+    # Off by default, and text only. The player was curious about seeing the
+    # roll and unsure whether he wanted it, so it is a toggle rather than a
+    # decision: the narration never mentions it either way (spec 3.2).
+    dice = False
     last: TurnResult | None = None
     print()
 
@@ -228,8 +268,13 @@ def main() -> int:
             elif command == "/dev":
                 dev = not dev
                 print(f"\ndev view {'on' if dev else 'off'}\n")
+            elif command == "/dice":
+                dice = not dice
+                print(f"\ndice {'shown' if dice else 'hidden'}\n")
             else:
-                print(f"\nNo such command. Try /sheet, /time, /cost, /dev, /quit.\n")
+                print(
+                    "\nNo such command. Try /sheet, /time, /cost, /dice, /dev, /quit.\n"
+                )
             continue
 
         # The voice loads while the resolver thinks, so the first sentence is
@@ -275,6 +320,10 @@ def main() -> int:
             continue
 
         print()  # the narration already went out, sentence by sentence
+
+        if dice and last.roll is not None:
+            # Printed, never spoken: the voice is the fiction and this isn't.
+            print(last.roll.as_dice())
 
         if dev:
             print(dev_view(store, resolver, last, call_log, voice))

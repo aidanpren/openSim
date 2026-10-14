@@ -16,7 +16,7 @@ from worldsim.sheet import character_sheet
 from worldsim.store import Store
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR, local_time
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 SPAWN = json.dumps(
     {
@@ -29,6 +29,8 @@ SPAWN = json.dumps(
             {"entity_id": "place:spawn-city", "key": "timezone", "value": "America/Chicago", "source": "world-knowledge", "visibility": "obvious"},
         ],
         "player_starts_in": "place:apartment",
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "opening_situation": "rent is late",
     }
 )
@@ -66,7 +68,7 @@ BACK_TO_THE_BAR = reply(
 
 def build(store, config, call_log, resolver_script, narrator_script):
     llm = FakeLLM(
-        config, call_log, {"resolver": resolver_script, "narrator": narrator_script}
+        config, call_log, scripts(resolver_script, narrator_script)
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)

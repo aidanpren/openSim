@@ -7,6 +7,9 @@ module validates and commits. It enforces, in code:
   old one and cites its cause, and the old row stays as history.
 - A second live fact for the same key on the same entity is rejected unless it
   comes through supersede().
+- Transient state is the other half of that split (spec 2.1) and lives in its
+  own table: current state only, overwritten freely, never refused as a
+  duplicate and never kept as history.
 - Numeric facts change only through apply_delta(), so nothing can write a total.
 - The clock never moves backward.
 - World tables and life tables are separate, so ending a life touches no fact.
@@ -52,6 +55,33 @@ CREATE TABLE IF NOT EXISTS facts (
 
 CREATE INDEX IF NOT EXISTS facts_live ON facts (entity_id, key, superseded_by);
 
+-- Transient state (spec 2.1). Posture, position within a place, what is in
+-- hand right now: true of this instant and not of tomorrow. One row per
+-- entity and key, overwritten in place, so there is no history and no
+-- supersession. The turn log keeps what changed and when.
+CREATE TABLE IF NOT EXISTS state (
+    entity_id TEXT NOT NULL REFERENCES entities(id),
+    key       TEXT NOT NULL,
+    value     TEXT NOT NULL,
+    set_at    TEXT NOT NULL,
+    cause     TEXT NOT NULL,
+    PRIMARY KEY (entity_id, key)
+);
+
+-- The timeline (spec 6.2), in its minimal form: dated events that fire when
+-- the clock passes them. Spawning schedules one to three; the resolver is told
+-- about each as it comes due. Milestone 3 builds chains and catch-up on top.
+CREATE TABLE IF NOT EXISTS timeline (
+    id             INTEGER PRIMARY KEY,
+    at             TEXT NOT NULL,
+    what           TEXT NOT NULL,
+    cause          TEXT NOT NULL,
+    reaches_player INTEGER NOT NULL DEFAULT 0,
+    fired_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS timeline_due ON timeline (fired_at, at);
+
 CREATE TABLE IF NOT EXISTS knowledge (
     id          INTEGER PRIMARY KEY,
     mind_id     TEXT NOT NULL REFERENCES entities(id),
@@ -84,9 +114,20 @@ CREATE TABLE IF NOT EXISTS turns (
     player_said TEXT NOT NULL,
     intent      TEXT,
     roll_json   TEXT,
-    narration   TEXT
+    narration   TEXT,
+    mode        TEXT,
+    state_json  TEXT
 );
 """
+
+# Columns added after worlds already existed. A world under saves/ is somebody's
+# life, so the schema moves forward around it rather than asking them to start
+# again. `CREATE TABLE IF NOT EXISTS` never alters a table that is already
+# there, which is why these have to be applied by hand.
+ADDED_COLUMNS = (
+    ("turns", "mode", "TEXT"),
+    ("turns", "state_json", "TEXT"),
+)
 
 
 class StoreError(Exception):
@@ -137,6 +178,29 @@ class Known:
 
 
 @dataclass(frozen=True)
+class State:
+    """One transient value as it stands right now (spec 2.1)."""
+
+    entity_id: str
+    key: str
+    value: str
+    set_at: datetime
+    cause: str
+
+
+@dataclass(frozen=True)
+class Scheduled:
+    """A timeline entry (spec 6.2). `fired_at` is None until the clock passes it."""
+
+    id: int
+    at: datetime
+    what: str
+    cause: str
+    reaches_player: bool
+    fired_at: datetime | None
+
+
+@dataclass(frozen=True)
 class Life:
     id: int
     character_id: str
@@ -167,6 +231,17 @@ def _row_to_fact(row: sqlite3.Row) -> Fact:
     )
 
 
+def _row_to_scheduled(row: sqlite3.Row) -> Scheduled:
+    return Scheduled(
+        id=row["id"],
+        at=_parse(row["at"]),
+        what=row["what"],
+        cause=row["cause"],
+        reaches_player=bool(row["reaches_player"]),
+        fired_at=_parse(row["fired_at"]),
+    )
+
+
 class Store:
     def __init__(self, db_path: Path, starts_at: datetime | None = None) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,11 +254,22 @@ class Store:
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self._open_transactions = 0
         if self.db.execute("SELECT 1 FROM clock WHERE id = 1").fetchone() is None:
             start = starts_at or datetime.now(timezone.utc)
             self.db.execute("INSERT INTO clock (id, now) VALUES (1, ?)", (_iso(start),))
         self.db.commit()
+
+    def _migrate(self) -> None:
+        """Add columns that worlds created before them are missing."""
+        for table, column, kind in ADDED_COLUMNS:
+            have = {
+                row["name"]
+                for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in have:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         self.db.close()
@@ -440,6 +526,118 @@ class Store:
             raise StoreError(f"no fact {fact_id}")
         return _row_to_fact(row)
 
+    # ---- transient state (spec 2.1) ----
+
+    def set_state(self, entity_id: str, key: str, value: str, cause: str) -> State:
+        """Write what is true of this instant. Overwrites, never refuses.
+
+        The opposite of add_fact on purpose. A fact is permanent and a second
+        live one is a conflict; transient state is current state, so the only
+        sensible answer to a new value is to take it. A playtest settled
+        `posture = "sitting on a bench"` as a fact and the refusal of every
+        correction after it meant the character was still sitting on that bench
+        at home in their kitchen.
+        """
+        if self.entity(entity_id) is None:
+            raise StoreError(f"no entity {entity_id!r} to hold state")
+        if not cause:
+            raise StoreError("every state change must cite a cause")
+        now = _iso(self.now())
+        self.db.execute(
+            "INSERT INTO state (entity_id, key, value, set_at, cause)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT (entity_id, key) DO UPDATE SET"
+            "   value = excluded.value, set_at = excluded.set_at,"
+            "   cause = excluded.cause",
+            (entity_id, key, str(value), now, cause),
+        )
+        self._commit()
+        return State(entity_id, key, str(value), _parse(now), cause)
+
+    def state(self, entity_id: str) -> list[State]:
+        """Everything transient about this entity right now, oldest key first."""
+        rows = self.db.execute(
+            "SELECT * FROM state WHERE entity_id = ? ORDER BY key", (entity_id,)
+        ).fetchall()
+        return [
+            State(
+                entity_id=r["entity_id"],
+                key=r["key"],
+                value=r["value"],
+                set_at=_parse(r["set_at"]),
+                cause=r["cause"],
+            )
+            for r in rows
+        ]
+
+    def state_of(self, entity_id: str, key: str) -> str | None:
+        row = self.db.execute(
+            "SELECT value FROM state WHERE entity_id = ? AND key = ?",
+            (entity_id, key),
+        ).fetchone()
+        return row["value"] if row else None
+
+    def clear_state(self, entity_id: str, keys: frozenset[str] | None = None) -> list[str]:
+        """Drop transient state. Returns the keys that were actually dropped.
+
+        Nothing is lost by this, which is what makes it safe: transient state
+        is never history. Used when a move makes a value meaningless — you
+        cannot still be sitting on a bench you have walked away from.
+        """
+        held = [s.key for s in self.state(entity_id)]
+        going = held if keys is None else [k for k in held if k in keys]
+        for key in going:
+            self.db.execute(
+                "DELETE FROM state WHERE entity_id = ? AND key = ?", (entity_id, key)
+            )
+        self._commit()
+        return going
+
+    # ---- the timeline (spec 6.2) ----
+
+    def schedule(
+        self, at: datetime, what: str, cause: str, reaches_player: bool = False
+    ) -> Scheduled:
+        """Put something on the clock. It fires when the world time passes it."""
+        if not cause:
+            raise StoreError("every timeline entry must cite a cause")
+        cursor = self.db.execute(
+            "INSERT INTO timeline (at, what, cause, reaches_player) VALUES (?, ?, ?, ?)",
+            (_iso(at), what, cause, 1 if reaches_player else 0),
+        )
+        self._commit()
+        return self.scheduled(cursor.lastrowid)
+
+    def scheduled(self, event_id: int) -> Scheduled:
+        row = self.db.execute(
+            "SELECT * FROM timeline WHERE id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"no timeline entry {event_id}")
+        return _row_to_scheduled(row)
+
+    def due(self, moment: datetime | None = None) -> list[Scheduled]:
+        """Unfired entries the clock has reached, oldest first."""
+        rows = self.db.execute(
+            "SELECT * FROM timeline WHERE fired_at IS NULL AND at <= ? ORDER BY at, id",
+            (_iso(moment or self.now()),),
+        ).fetchall()
+        return [_row_to_scheduled(r) for r in rows]
+
+    def pending(self) -> list[Scheduled]:
+        """Everything still ahead, for the dev view."""
+        rows = self.db.execute(
+            "SELECT * FROM timeline WHERE fired_at IS NULL ORDER BY at, id"
+        ).fetchall()
+        return [_row_to_scheduled(r) for r in rows]
+
+    def mark_fired(self, event_id: int) -> None:
+        self.db.execute(
+            "UPDATE timeline SET fired_at = ? WHERE id = ?",
+            (_iso(self.now()), event_id),
+        )
+        self._commit()
+
     # ---- knowledge (spec 2.3, 2.4) ----
 
     def learn(
@@ -544,11 +742,22 @@ class Store:
         intent: str | None,
         roll_json: str | None,
         narration: str | None,
+        mode: str | None = None,
+        state_json: str | None = None,
     ) -> int:
+        """Record the turn. `state_json` is every transient change it made.
+
+        Transient state keeps no history of its own, so this is the history:
+        spec 2.1 asks that a change still be readable afterwards, and the dev
+        view and any later audit read it from here.
+        """
         cursor = self.db.execute(
             "INSERT INTO turns (life_id, world_time, player_said, intent, roll_json,"
-            " narration) VALUES (?, ?, ?, ?, ?, ?)",
-            (life_id, _iso(self.now()), player_said, intent, roll_json, narration),
+            " narration, mode, state_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                life_id, _iso(self.now()), player_said, intent, roll_json,
+                narration, mode, state_json,
+            ),
         )
         self._commit()
         return cursor.lastrowid

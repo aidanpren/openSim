@@ -67,7 +67,7 @@ Each one gets a test when its system is built. Never weaken a test to make it pa
 
 1. The world store is the only source of truth. Models propose; code validates and commits.
 2. Every turn is resolve, commit, render. The narrator never creates or changes facts.
-3. Facts are never edited or deleted. A change is a new fact that supersedes the old one and cites its cause.
+3. Facts are never edited or deleted. A change is a new fact that supersedes the old one and cites its cause. Transient state is not a fact: posture, position in a room and what's in hand live in their own table, are overwritten freely, and are recorded in the turn log. The question that decides which is "would this still be true tomorrow if nobody did anything about it?" (spec 2.1)
 4. Quantities like cash and counts change by deltas applied in code. Models never write totals.
 5. The narrator's context holds only what the player character knows or perceives. Hidden facts, other people's minds, the timeline, and the director's plans never reach it.
 6. Randomness comes from code (`random.Random`, seedable). The resolver writes both outcomes before code rolls.
@@ -77,7 +77,11 @@ Each one gets a test when its system is built. Never weaken a test to make it pa
 
 ## Narration (spec section 4)
 
-Two to four spoken sentences, second person, present tense. Never narrate the player's choices, words, thoughts, or feelings. No game language: dice, odds, quests, objectives, stats. No lists or markdown. No closing prompt like "What do you do?" Narrate outcomes, not procedures.
+A turn is two beats: the **attempt**, narrated before the resolver runs, and the **outcome**, which ends on what's different now.
+
+Narrate the action the player declared as it happens — the effort, the body, how it goes. Never add choices, words, thoughts, or feelings they didn't give; sensations the world causes are fine. Speech they gave can be voiced, quoted or reported; speech they didn't give is never invented. Narrate the doing, never a how-to.
+
+Second person, present tense, spoken English. Length follows the moment, with a hard ceiling of six sentences a turn. No game language: dice, odds, quests, objectives, stats. No lists or markdown. End on what's in front of the character, never on "What do you do?"
 
 ## Code conventions
 

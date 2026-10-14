@@ -41,6 +41,27 @@ The person a fact is about is one of the people it hides from. On a fact about t
 
 **Rule:** Quantities like cash and counts change by deltas that code applies. A model never writes a new total.
 
+#### Facts and transient state
+
+Not everything true right now is a fact. One question decides which half of the store something belongs in:
+
+> Would this still be true tomorrow if nobody did anything about it?
+
+Yes, and it's a fact, bound by the rule above. A broken wrist, a debt, a name, the hours a bar keeps, what a landlord has decided.
+
+No, and it's **transient state**: posture, where in the room, what's in hand right now, out of breath, drunk, furious. Transient state is current state and nothing else. It has one row per entity and key, it's overwritten in place, and a new value is never refused as a duplicate — because "already sitting" is not a reason to refuse "now standing". There's no history and no supersession, so every change is recorded in the turn log instead, which is where `/dev` and any later audit read it.
+
+The hard cases fall out of the question. Drunk is state, alcoholic is a fact. Bleeding is state, a knife wound is a fact. Angry is state, hates you is a fact.
+
+Two further rules keep the split honest:
+
+- **A move clears place-bound state.** You can't still be sitting on a bench you've walked away from, so code clears posture, position, activity and vantage when an entity moves. What's in your hand isn't place-bound: the bottle comes out of the bar with you.
+- **Transient state is always what anyone present could see.** That's what makes it safe to hand to the narrator without a visibility flag. Anything secret is a fact with a visibility, never state.
+
+This split exists because the alternative was measured. A 30-turn playtest settled `posture = "sitting on a bench"` as a fact; every correction after it was refused, and the character was still sitting on that bench at home in their kitchen twenty turns later. It was the only finding that made the store wrong rather than merely stale.
+
+A model that writes transient state as a fact has it routed to state by code, not dropped. The prompt asks for the right channel and mostly gets it; when it doesn't, the choice is between a world that moves and a world that freezes.
+
 ### 2.2 Resolving on first need
 
 The world starts nearly empty, and nothing is decided until something needs it. When the resolver needs a fact the store doesn't have, it settles it in this order:
@@ -71,15 +92,39 @@ Each turn, the resolver decides which facts the player character notices, based 
 
 ## 3. The turn
 
+### 3.0 Input modes
+
+Before anything is resolved, code reads which channel the player is speaking on. Every line used to be resolved as an in-world action, so "What am I doing?" became the character saying those words out loud, and the world answered honestly that nobody replied. The engine was faithful to the wrong channel.
+
+| Mode | What it is | What happens |
+|---|---|---|
+| `command` | a `/` line | handled by code, outside the fiction |
+| `question` | put to the narrator, about the character themselves | answered from their own knowledge and state: no roll, no time, no new facts, and no resolver call at all |
+| `look` | asked of the world, and nobody present can answer | resolved as a look, because settling it *is* the answer |
+| `speech` | said aloud to somebody who's here | resolved, with the substance in `you_said_aloud` |
+| `action` | everything else | resolved |
+
+Classification is code, not a model call: it's deterministic, it costs nothing, and `action` is the fallback, so a misread is the behaviour the engine had before. A question is recognised by being interrogative and about the character — any first-person pronoun. The starting rule for the rest is the one the player set: if somebody is present and it could be speech, it's speech.
+
+**Rule:** A question to the narrator moves no clock, writes no fact, and rolls nothing.
+
 ### 3.1 Resolver output
 
 The resolver streams **three JSON objects back to back**, each validated with pydantic and committed as it closes, because the player waits only on the first.
 
-1. **Opening** — where the character ends up, `duration_minutes`, `intent`, `uncertain`, and the two or three facts they register first. Roughly sixty tokens. This is the whole of what has to exist before anyone speaks.
-2. **Scene** — the rest of the truth: who else is present, what they look like, `dialogue`, `you_said_aloud`, `summary`, `scene_change`. Narrated as a second beat, which is also how a room lands: the place, then the person in it.
-3. **Ledger** — what the character does not perceive now: superseding facts, quantity deltas, moves, other people's knowledge, `ends_life`, and the roll.
+1. **Opening** — where the character ends up, `duration_minutes`, `intent`, `uncertain`, `state`, and the two or three facts they register first. Roughly sixty tokens.
+2. **Scene** — the rest of the truth: who else is present, what they look like, `dialogue`, `you_said_aloud`, `state`, `summary`, `scene_change`. The outcome is narrated from this object.
+3. **Ledger** — what the character does not perceive now: superseding facts, quantity deltas, moves, other people's knowledge, `schedule`, `ends_life`, and the roll.
 
 Each object commits before the beat that speaks it, so rule 1 holds throughout. Retries work on one boundary: until the opening is handed over nothing is committed, so a bad reply spends the spec 3.3 retry. After that there is no going back, and a malformed tail is reported as lost writes rather than replayed.
+
+The resolver is also told `input_mode` (section 3.0) and `happening_now`, which is whatever the clock has just fired (section 6.2).
+
+#### What the action changed
+
+The resolver says what the action changed **for the player**: what they can now see, reach, or do that they couldn't a moment ago. It travels as transient `state` on them, or as facts they now perceive, and the narrator closes the turn on it.
+
+This is the difference between an effect and a payoff. "You are on the table" is an effect. The vantage from up there — and whatever is worth seeing over a crowd for — is the payoff, and it's the reason the action was worth taking. Without it an action reads as a status line, which is what the player reported.
 
 An `obvious` fact about the character, the place they are in, or something in it with them is perceived by code — that is what `obvious` means — so `perceived` carries only the `noticeable` and `hidden` exceptions.
 
@@ -101,10 +146,11 @@ An outcome holds superseding facts, quantity deltas, moves (who and what is now 
 - Odds come from the situation: skill, condition, tools, circumstances, and real-world base rates.
 - Where a real procedure exists, code runs it with real odds instead of using one probability: roulette, blackjack, slot machines, dice games. These can wait until milestone 6.
 - The resolver writes both outcomes before the roll. Code rolls with a seedable `random.Random` and commits the matching branch.
+- Code knows how close the roll was, and bands the margin into words: barely, with some effort, easily; by a hair, clearly, badly. The narrator is given the band and never the number, so a near miss sounds like one. A near miss that reads exactly like a hopeless one is the same turn twice, and the difference between them is most of what makes a risk feel like a risk.
 
 **Rule:** No model sees a roll before both outcomes exist. Every roll is logged with its odds, both outcomes, and the result.
 
-**Rule:** Narration never mentions rolls, odds, or the numbers behind them. They appear only in the dev view (section 13.5).
+**Rule:** Narration never mentions rolls, odds, or the numbers behind them. They appear only in the dev view (section 13.5), and in the optional `/dice` readout, which is off by default and printed rather than spoken.
 
 ### 3.3 When a model call fails
 
@@ -114,18 +160,47 @@ Invalid JSON gets one retry with the validation error attached. If the retry als
 
 The narrator turns committed results into speech. It never decides anything.
 
+### 4.1 The shape of a turn
+
+A turn reaches the player in two beats.
+
+1. **The attempt**, narrated *before the resolver is called at all*. The player's declared action is the one thing that's true before the outcome exists, so it's the only honest thing to say while the world is still deciding. It never assumes success — "you jump", never "you land" — and because nothing has been settled yet it cannot introduce anything new, which is how rules 2 and 5 hold of it for free. One sentence.
+2. **The outcome**, narrated when the scene object closes, or after code has rolled. It says how it went and ends on what's different now.
+
+So the arc of every turn is: the attempt, the outcome, and what it opened up. A turn that stops after the effect is half a turn.
+
+Two beats, two narrator calls, no more. The opening object used to drive a beat of its own, and with the outcome not yet written that beat had nothing to say but the room — so it said the room again, which is the repetition the player reported. The attempt covers the same seconds with something true, and takes the first spoken word from the close of the first JSON object to the first narrator token.
+
+If the world interrupts before the attempt finishes, the outcome continues the sentence: "…but a hand closes on your collar."
+
+A question to the narrator (section 3.0) skips the attempt and gets a direct answer instead.
+
+### 4.2 The contract
+
 **Rule (the narration contract):**
 
-- Use second person, present tense, and plain spoken English. Two to four sentences, unless the player asks for more.
-- Say only what the player character perceives or knows. Choose what's salient: what changed, what's new, what this person would notice, and the answer to any question.
-- Never narrate the player's choices, words, thoughts, or feelings. Sensations the world causes, like cold, pain, or a racing heart, are fine.
+- **Narrate the action the player declared, as it happens**: the effort, the body, how it goes. They gave you the action; it's yours to tell. "You muster your strength and jump onto the table" is the voice.
+- **Never add what they didn't give.** No choice, thought, feeling, or gesture the player didn't put there. "You decide to wave" and "You feel proud" are not yours to say. Sensations the world causes — cold, pain, a racing heart — are the world's, and are fine.
+- **Speech they gave may be voiced, quoted, or reported.** Speech they didn't give is never invented, in any form.
+- Use second person, present tense, and plain spoken English.
+- Say only what the player character perceives or knows. Choose what's salient: what changed, what's new, what this person would notice.
 - Never use game language: dice, rolls, odds, quests, objectives, stats, levels, the director.
 - No lists or formatting, because it's spoken.
-- Don't end with a prompt like "What do you do?" Stop when the world stops.
+- **End on what's in front of the character**: someone waiting, a sound, a car slowing. Never a prompt like "What do you do?", and never a suggestion of what they might want.
 - People talk in their own voice, from their own knowledge, lies included.
-- Narrate outcomes, not procedures. Picking a lock, hotwiring a car, or building something is told as what happens and how it goes, never as real-world step-by-step instructions.
+- **Narrate the doing, never a how-to.** Picking a lock, hotwiring a car, or stitching a wound is told as what happens and how it goes, never as real-world step-by-step instructions. (This was "outcomes, not procedures", which was read as "don't describe the action at all" and suppressed the thing above.)
 
-Questions about the surroundings ("What's the first store I see?") are answered from what the character can perceive. If the answer isn't settled yet, it's resolved first.
+Code holds the first three of these, because prompts didn't. The check is narrow by design: it catches decisions, thoughts and chosen gestures, which are recognisable by their verbs, and it permits any verb the player used themselves — "I nod" has to make "you nod" legal. Invented speech is a breach only when the resolver settled that the player said nothing. An invented *feeling* is left to the prompt and the playtest read-through, because no pattern separates "you feel proud" from "you feel the cold on your face".
+
+### 4.3 Length and repetition
+
+Length follows the moment, rather than one fixed cap for everything. A routine action or a question gets a line; a moment with people in it or something at stake earns more. There's a hard ceiling of six sentences a turn, because that's what a voice can hold, and the allowance is spent across the beats.
+
+Editing is part of the job. Nothing charged happening — walking home, waiting, queueing — compresses to one line and lands on the next thing that matters: "Twenty minutes later you're at your door. There's a note taped to it." Only true things count. When something's at stake, slow down.
+
+**Rule:** No sentence repeats something the player has already been told. Before a sentence goes to text or speech it's compared against the last six narrated sentences, by what it's *about* rather than its wording, and near-duplicates are dropped. This is deterministic — no model call sits between a sentence and the speaker. Exact repeats were already caught; this closes paraphrases like "the fluorescent light above flickers" followed by "the fluorescent light above the sink flickers".
+
+Silence is still worse than a repeat. If the filter eats everything, the narrator is asked once for something new, and only then does a repeat go out.
 
 ## 5. Memory and context
 
@@ -195,6 +270,10 @@ When the clock passes an entry, it fires. Firing can create facts, change what p
 
 Deadlines get exact timestamps. Only action durations are estimated.
 
+**Built, in its minimal form.** A `timeline` table holds dated entries; spawning schedules one to three, and the resolver can schedule more from the ledger. Entries are written as minutes from now, because the arithmetic is code's job — a model asked for an ISO time in the world's own zone got it wrong often enough to put a deadline in the past. At the start of each turn, everything the clock has passed is collected, handed to the resolver as `happening_now`, and marked fired once the opening commits, so a turn that never commits leaves them still due. The resolver makes them true in the world, and the player finds out as the character would.
+
+What's deliberately not here yet, and belongs to milestone 3: chains, silence (section 6.3), skips with catch-up (section 6.4), and the director that writes entries of its own (section 7). This is the foundation for those, not a stand-in to be thrown away.
+
 ### 6.3 Silence counts
 
 Everyone close to the player character has a last-contact time and an expectation of how often they'll hear from them. When the relationship is created, a background call writes what that person does as silence grows, as timeline entries: worried after two days, calls your brother after a week, files a missing-person report after two weeks. Contact pushes those entries back. Telling them you'll be gone for three months rewrites them.
@@ -243,6 +322,12 @@ Strangers are created on first meeting, and from then on they're permanent like 
 ## 9. Lives and the persistent world
 
 - **Spawning:** a new life starts as a specific person in a real city, with a name, age, job, history, and people. Code draws their station in life before the model is called, weighted so the ordinary middle is the standard and both extremes, destitute and wealthy, are rare. Whatever the station, the person wants something they don't have and something is in the way of it. That's the friction, and it isn't the same as hardship: an allowance with no say in anything is friction, and so is a brother who keeps borrowing the van. The weights live in `resolve.STATIONS`, because a model asked for "a person with at least one source of friction" writes the same broke, lonely line cook every time. There are no quests; wants grow out of the situation. The default spawn city is Kansas City, Missouri, set by `SPAWN_CITY`.
+- **Spawning in motion:** the life doesn't begin, it's already under way. Three things are settled before the player says a word.
+  - **A deadline inside the first in-game hour**, with a real cost if it's ignored, put on the timeline so it actually arrives (section 6.2). It is not a quest: nothing points at it, the player can walk away, and it plays out without them.
+  - **Two to four secrets**, committed as `hidden` facts. Resolution is otherwise lazy, so digging used to find improvisation rather than something that was already there. The theatre-of-the-mind game this grew out of worked because the base existed before anyone looked at it. The secrets have to fit each other and the situation, and a secret is not a twist — it's a true thing nobody has told them.
+  - **A premise that isn't the last one.** Recent premises are kept outside any world and fed back to the next spawn, because the station weights fixed how comfortable a life is and left what it's *about* untouched: every life was a broke twenty-something in an apartment. Not every life is crime.
+  
+  A spawn that settles no secrets, or puts nothing inside the hour, is refused and spends its retry with the reason attached. The opening narration is a moment, never a stat block; the biography lives on `/sheet`.
 - **Death:** death is permanent for that character. The life ends with one closing line, and the next life starts as someone new.
 - **The world outlives every life:** the dead character's possessions, property, and consequences stay. A new life might walk past the store the last one burned.
 
@@ -313,6 +398,7 @@ A terminal loop: the player types and the narration prints. Commands start with 
 - `/sheet`: show the character sheet
 - `/time`: show the local date and time where the character is
 - `/cost`: show this session's spend
+- `/dice`: toggle an inline roll readout, like `(d20: 16, needed 9)`. Off by default, printed and never spoken. It's a reading of the roll that already happened, inverted because code rolls low-is-good, and it never contradicts the branch that was committed.
 - `/dev`: toggle the dev view (section 13.5)
 
 ### 13.2 Voice at a desk
@@ -341,7 +427,8 @@ The dev view is hidden during normal play. It shows the truth at the current pla
 - Unit tests never touch the network. A `FakeLLM` returns scripted responses.
 - Each Rule gets a test when its system is built. The key ones:
   - **Revisit:** a place's facts are identical after leaving and returning.
-  - **Hidden facts:** a `hidden` fact's text never appears in a logged narrator prompt.
+  - **Hidden facts:** a `hidden` fact's text never appears in a logged narrator prompt, including on a question turn.
+  - **Transient state:** sitting on a bench and then walking home leaves the character home and not sitting; no transient value is ever refused as a duplicate.
   - **Rolls:** with a fixed seed, the committed outcome matches the branch the roll picked.
   - **Deltas:** cash after a win equals cash before plus the delta.
   - **Clock:** time never decreases, and a skip fires entries in order and stops at the first one that reaches the player.

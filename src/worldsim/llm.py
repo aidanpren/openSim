@@ -578,7 +578,14 @@ def _strip_fences(text: str) -> str:
 class OpenRouterLLM(_BaseLLM):
     """The real client. Created by __main__.py when a key is present."""
 
-    def __init__(self, config: Config, call_log: CallLog, max_tokens: int = 1200) -> None:
+    # A turn's three objects come to about 600 output tokens and a narration to
+    # about 50, so this ceiling is for the spawn, which is one large object:
+    # entities, facts, secrets, the schedule and the opening state. At 1200 a
+    # live spawn was cut off mid-fact — "EOF while parsing at line 166" — and
+    # the retry, writing the same shape again, had no more room than the first.
+    # Output is billed on what is generated, not on what is reserved, so the
+    # headroom is free until something needs it.
+    def __init__(self, config: Config, call_log: CallLog, max_tokens: int = 2400) -> None:
         super().__init__(config, call_log)
         from openai import OpenAI
 

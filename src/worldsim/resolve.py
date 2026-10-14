@@ -37,40 +37,68 @@ def is_quantity(key: str) -> bool:
     return key.endswith(QUANTITY_SUFFIXES)
 
 
-# Facts are forever (rule 3), so a fact is the wrong home for anything that
-# changes every turn. A live playtest settled `posture = "sitting on a bench"`
-# on the player, and because a second live value for a key is refused rather
-# than treated as a change, it still said that after they had walked home — and
-# nothing could correct it.
+# Spec 2.1's split, decided by one question:
 #
-# Two kinds are refused outright. These restate what the store already models
-# structurally: an entity's place is `location_id`, and what is in a place comes
-# from its contents.
+#     would this still be true tomorrow if nobody did anything about it?
+#
+# Yes, and it is a fact: a broken wrist, a debt, a landlord's decision, the
+# bartender's name. All of those survive the night on their own, so rule 3
+# applies and a change is a supersession citing its cause.
+#
+# No, and it is transient state: posture, where in the room, what is in hand,
+# out of breath. None of those outlive the moment, so there is nothing for
+# history to keep and the only sensible response to a new value is to take it.
+# A live playtest settled `posture = "sitting on a bench"` as a fact; every
+# correction after it was refused as a duplicate, and the character was still
+# sitting on that bench at home in their kitchen.
+#
+# The hard cases fall out of the question. "Drunk" is state — sober by
+# tomorrow. "Alcoholic" is a fact. "Bleeding" is state, "a knife wound" is a
+# fact. "Angry" is state, "hates you" is a fact.
+TRANSIENT_KEYS = frozenset(
+    {"posture", "position", "stance", "facing", "activity", "action",
+     "current_action", "currently", "doing", "busy_with", "holding",
+     "in_hand", "carrying_now", "phone_action", "expression", "mood",
+     "frustration", "hunger_level", "thirst", "out_of_breath", "state",
+     "vantage", "attention", "looking_at", "seated_at", "standing_on"}
+)
+
+# Transient state that belongs to the place it was set in. You cannot still be
+# sitting on a bench you walked away from, so these are cleared when the entity
+# moves rather than waiting for a model to remember to correct them. What is in
+# your hand is deliberately not here: the beer comes out of the bar with you.
+PLACE_BOUND_STATE = frozenset(
+    {"posture", "position", "stance", "facing", "activity", "action",
+     "current_action", "currently", "doing", "busy_with", "phone_action",
+     "vantage", "attention", "looking_at", "seated_at", "standing_on"}
+)
+
+# Refused outright, because the store already models these structurally: an
+# entity's place is `location_id`, and what is in a place comes from its
+# contents. A copy in a fact or in state only goes stale.
 STRUCTURAL_KEYS = frozenset(
-    {"location", "location_id", "position", "whereabouts", "occupants",
-     "contents", "inside", "contains"}
+    {"location", "location_id", "whereabouts", "occupants", "contents",
+     "inside", "contains"}
 )
-# And these are momentary by nature. Durable condition is a different thing and
-# stays a fact: a broken wrist, a debt, a fever are all true tomorrow.
-MOMENTARY_KEYS = frozenset(
-    {"posture", "activity", "action", "current_action", "currently", "doing",
-     "stance", "phone_action", "frustration", "hunger_level", "state"}
-)
+
+
+def is_transient(key: str) -> bool:
+    """Whether this key is current state rather than a fact (spec 2.1)."""
+    return key.lower() in TRANSIENT_KEYS
 
 
 def not_a_fact(key: str) -> str | None:
-    """Why this key cannot be a fact, or None if it can be."""
-    plain = key.lower()
-    if plain in STRUCTURAL_KEYS:
+    """Why this key belongs in neither half of the store, or None if it does.
+
+    Transient keys are not refused here any more: code routes them into the
+    state table instead, so a model that writes posture as a fact still gets a
+    world that changes. Only what the store already holds structurally is
+    dropped.
+    """
+    if key.lower() in STRUCTURAL_KEYS:
         return (
             f"{key!r} restates where something is, which the store already "
             "holds as the entity's location. Move it, do not describe it"
-        )
-    if plain in MOMENTARY_KEYS:
-        return (
-            f"{key!r} changes from turn to turn, and a fact is permanent. "
-            "Leave it out — where they are and what they were doing are "
-            "already known. Lasting condition is still a fact"
         )
     return None
 
@@ -245,6 +273,48 @@ class Learned(BaseModel):
         )
 
 
+class StateChange(BaseModel):
+    """One transient value, as it stands at the end of this turn (spec 2.1).
+
+    Overwrites whatever was there, so there is no supersession and no conflict.
+    This is where the payoff of an action lands: climbing onto the table makes
+    `posture` "standing on the table" and `vantage` "you can see over the crowd
+    to the back door", and the narrator closes the turn on exactly that.
+    """
+
+    entity_id: str
+    key: str
+    value: str | float
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(data, ("entity_id", "key", "value"), {})
+
+    @model_validator(mode="after")
+    def as_words(self) -> StateChange:
+        self.value = as_text(self.value)
+        return self
+
+
+class Scheduling(BaseModel):
+    """Something put on the clock, `in_minutes` from now (spec 6.2).
+
+    Minutes rather than a timestamp because the arithmetic is code's job: a
+    model asked for an ISO time in the world's own zone got it wrong often
+    enough that a deadline could land in the past.
+    """
+
+    in_minutes: float = Field(ge=0)
+    what: str
+    reaches_player: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_compact(cls, data):
+        return _expand(data, ("in_minutes", "what", "reaches_player"), {})
+
+
 class Line(BaseModel):
     speaker_id: str
     gist: str
@@ -280,6 +350,8 @@ class Outcome(BaseModel):
     # What the player notices in this branch specifically. The scene's own
     # `perceived` covers what was true before the roll decided anything.
     perceived: list[Perceived] = Field(default_factory=list)
+    # Where the action left everyone's posture and vantage in this branch.
+    state: list[StateChange] = Field(default_factory=list)
     ends_life: bool = False
 
 
@@ -288,6 +360,39 @@ class Roll(BaseModel):
     why: str
     on_success: Outcome
     on_failure: Outcome
+
+
+# How close the roll was, in words. Code knows the margin and the narrator must
+# never see a number (spec 3.2), so the margin is banded here and the band is
+# what travels. A near miss that reads exactly like a hopeless one is the same
+# turn twice, and the difference between them is most of what makes a risk feel
+# like a risk.
+#
+# Banded on how far through the range the roll landed, not on the raw distance
+# to the threshold. Raw distance reads the odds as if they were not there: at
+# 45% a draw of 0.24 is two fifths of the way into the success range, an
+# ordinary win, and the raw margin of 0.21 called it "better than it had any
+# right to".
+BY_A_HAIR = 0.85
+COMFORTABLY = 0.33
+
+
+def margin_band(p_success: float, rolled: float, succeeded: bool) -> str:
+    """One line on how it went, for the narrator. Never the odds."""
+    if succeeded:
+        # 0 is the far end of the range it needed, 1 is the threshold itself.
+        share = rolled / p_success if p_success > 0 else 1.0
+        if share >= BY_A_HAIR:
+            return "it works, but only barely — a hair either way and it would not have"
+        if share >= COMFORTABLY:
+            return "it works, with some effort"
+        return "it works easily, better than it had any right to"
+    share = (rolled - p_success) / (1 - p_success) if p_success < 1 else 1.0
+    if share <= 1 - BY_A_HAIR:
+        return "it fails by a hair — it was almost there, and the near miss shows"
+    if share <= 1 - COMFORTABLY:
+        return "it clearly fails"
+    return "it fails badly, worse than expected"
 
 
 class Opening(BaseModel):
@@ -323,6 +428,10 @@ class Opening(BaseModel):
     new_entities: list[NewEntity] = Field(default_factory=list)
     new_facts: list[NewFact] = Field(default_factory=list)
     perceived: list[Perceived] = Field(default_factory=list)
+    # Posture and vantage belong here for the same reason `player_location`
+    # does: both are where the action left the character, and both have to
+    # survive a stream that dies before the scene closes.
+    state: list[StateChange] = Field(default_factory=list)
 
 
 class Scene(BaseModel):
@@ -344,6 +453,10 @@ class Scene(BaseModel):
     new_entities: list[NewEntity] = Field(default_factory=list)
     new_facts: list[NewFact] = Field(default_factory=list)
     perceived: list[Perceived] = Field(default_factory=list)
+    # What the action left different: posture, vantage, what is in hand. The
+    # narrator closes the turn on this, which is what stops an action from
+    # reading as an effect with no payoff (step 2d of the feel pass).
+    state: list[StateChange] = Field(default_factory=list)
     dialogue: list[Line] = Field(default_factory=list)
     scene_change: bool = False
 
@@ -364,6 +477,9 @@ class Ledger(BaseModel):
     deltas: list[Delta] = Field(default_factory=list)
     moves: list[Move] = Field(default_factory=list)
     learned: list[Learned] = Field(default_factory=list)
+    # Dated consequences (spec 6.2). The deadline a turn creates has to actually
+    # arrive, or pressure is only ever a line of description.
+    schedule: list[Scheduling] = Field(default_factory=list)
     ends_life: bool = False
     roll: Roll | None = None
 
@@ -387,6 +503,11 @@ STATIONS: tuple[tuple[int, str], ...] = (
 )
 
 
+def _state_lines(store: Store, entity_id: str) -> dict:
+    """An entity's transient state as plain key-to-value (spec 2.1)."""
+    return {held.key: held.value for held in store.state(entity_id)}
+
+
 def _regroup(entries: list[tuple[str, str, dict]]) -> dict:
     """Facts back into the nested shape resolver.md documents."""
     out: dict[str, dict] = {}
@@ -403,13 +524,48 @@ def draw_station(rng: random.Random) -> str:
     )[0]
 
 
+# A life opens in the middle of something, so the spawn has to settle both
+# halves of that: what is already happening, and what is already hidden.
+SECRETS_WANTED = (2, 4)
+EVENTS_WANTED = (1, 3)
+# "A deadline inside the first in-game hour" (step 3a). Sixty-five rather than
+# sixty so a model that writes "in an hour" is taken at its word.
+SOON_MINUTES = 65
+
+
 class SpawnOutput(BaseModel):
     new_entities: list[NewEntity] = Field(default_factory=list)
     new_facts: list[NewFact] = Field(default_factory=list)
+    # Settled before the player can look, so digging finds something solid
+    # rather than improvisation. Visibility is forced below: a secret the
+    # character knows is not a secret, and a `hidden` fact about them is one
+    # they do not know either (spec 2.1).
+    secrets: list[NewFact] = Field(default_factory=list)
+    # The pressure the life opens under, and it has to actually arrive, which is
+    # what the minimal clock is for (spec 6.2).
+    schedule: list[Scheduling] = Field(default_factory=list)
+    # Posture and vantage at the moment the world opens, so the first turn
+    # starts from a body somewhere rather than from nowhere.
+    state: list[StateChange] = Field(default_factory=list)
     # Where the character actually is. Without this they stand in the bare city
     # entity, which makes everyone in town read as present in the room.
     player_starts_in: str | None = None
     opening_situation: str
+    # A handful of words naming the kind of life, so the next spawn can be told
+    # not to write this one again. Every life was a broke twenty-something in an
+    # apartment until something kept score.
+    premise: str = ""
+
+    @model_validator(mode="after")
+    def shape_the_spawn(self) -> SpawnOutput:
+        # Trimmed rather than refused: too many is a model being generous, and
+        # losing a whole life over it would be absurd. Too few is checked
+        # against the store instead, where it can spend a retry.
+        self.secrets = self.secrets[: SECRETS_WANTED[1]]
+        for secret in self.secrets:
+            secret.visibility = "hidden"
+        self.schedule = self.schedule[: EVENTS_WANTED[1]]
+        return self
 
 
 class Resolver:
@@ -426,8 +582,14 @@ class Resolver:
     def _prompt(self, name: str) -> str:
         return (self.prompts_dir / name).read_text()
 
-    def spawn(self, station: str) -> SpawnOutput:
-        """Build a life. `station` is drawn by code, not chosen by the model."""
+    def spawn(self, station: str, avoid: list[str] | None = None) -> SpawnOutput:
+        """Build a life. `station` is drawn by code, not chosen by the model.
+
+        `avoid` is the premises of recent lives. Asked cold for "a person with
+        a situation in motion", a model writes the same hungover
+        twenty-something in a one-bedroom every time; the station weights fixed
+        how comfortable a life is and left what it is *about* untouched.
+        """
         user = as_prompt(
             {
                 "city": self.config.spawn_city,
@@ -440,17 +602,68 @@ class Resolver:
                 "player_entity_id": PLAYER_ID,
                 "city_entity_id": SPAWN_PLACE_ID,
                 "station_in_life": station,
+                "recent_premises_do_not_repeat": avoid or [],
             }
         )
-        return self.llm.json("resolver", self._prompt("spawn.md"), user, SpawnOutput)
+        # Strict once, then take what arrives. A refused spawn is not a worse
+        # life, it is no game at all — the player gets "the world could not be
+        # started" and nothing to play. So the check spends the one retry with
+        # its reason attached and then stands down; the rejected attempt and
+        # why it was rejected are in the call log either way (rule 9).
+        asked_once = []
+
+        def check(spawned: SpawnOutput) -> None:
+            if asked_once:
+                return
+            asked_once.append(True)
+            self.check_spawn(spawned)
+
+        return self.llm.json(
+            "resolver", self._prompt("spawn.md"), user, SpawnOutput, check
+        )
+
+    def check_spawn(self, spawned: SpawnOutput) -> None:
+        """A life has to open under pressure, with something already hidden.
+
+        Raising spends the spawn's one retry (spec 3.3) with the reason
+        attached, which is the only way the model learns it wrote a life that
+        is merely described rather than already happening.
+        """
+        if len(spawned.secrets) < SECRETS_WANTED[0]:
+            raise ValueError(
+                f"only {len(spawned.secrets)} secrets. Write "
+                f"{SECRETS_WANTED[0]} to {SECRETS_WANTED[1]} things that are "
+                "true about this life and that the character does not know, in "
+                "`secrets`. They are what makes digging find something."
+            )
+        if len(spawned.schedule) < EVENTS_WANTED[0]:
+            raise ValueError(
+                "`schedule` is empty. Put the thing that is already happening "
+                "on the clock: what it is, and how many minutes from now."
+            )
+        if not any(e.in_minutes <= SOON_MINUTES for e in spawned.schedule):
+            soonest = min(e.in_minutes for e in spawned.schedule)
+            raise ValueError(
+                f"the soonest scheduled thing is {soonest:.0f} minutes away. "
+                f"One of them has to land within {SOON_MINUTES} minutes, or the "
+                "life opens with nothing pressing on it."
+            )
 
     def resolve(
         self,
         player_said: str,
         recent: list[str],
         on_object: Callable[[int, object], None],
+        mode: str = "action",
+        events: list[str] | None = None,
     ) -> tuple[Opening, Scene, Ledger]:
-        """Stream one call. `on_object` fires as each of the three is valid."""
+        """Stream one call. `on_object` fires as each of the three is valid.
+
+        `mode` is how code read the input (spec 3.1): an action, speech, or a
+        question the player put to the narrator that needs something settled
+        before it can be answered. `events` are timeline entries the clock has
+        just passed, which is how a deadline actually arrives.
+        """
         # Imported here, not at module scope: sheet.py reads PLAYER_ID from
         # this module, so a top-level import would close the loop.
         from .sheet import time_of_day
@@ -470,12 +683,21 @@ class Resolver:
         )
         payload: dict = {
             "player_said": player_said,
+            # How code read the input. The engine used to resolve every line as
+            # an in-world action, so "What am I doing?" became the character
+            # saying it out loud to an empty room.
+            "input_mode": mode,
             # Local, in plain words, and not the raw UTC stamp this used to be.
             # The resolver settles the facts, so when it read 20:01 UTC as
             # evening it wrote "city skyline at dusk" onto a kitchen window at
             # three in the afternoon — and that is now permanently true.
             "the_time": time_of_day(self.store),
             "world_time_utc": self.store.now().isoformat(),
+            # Timeline entries the clock has just passed (spec 6.2). These are
+            # happening whether or not the player's action has anything to do
+            # with them, and they have the first claim after the input itself.
+            "happening_now": events or [],
+            "your_state": _state_lines(self.store, PLAYER_ID),
             "recent_turns": [],
             "truth_here": {},
         }
@@ -535,8 +757,15 @@ class Resolver:
         # Only the player's own chain is enforced. An entity off to one side
         # with nowhere to live is harmless and stays a reported dropped write;
         # this one is the difference between the truth and the narration.
+        # Only the chain of places that do not exist yet is walked. A model
+        # re-listing somewhere that is already in the store is harmless — code
+        # skips an entity it already has — but reading its *proposed* parent as
+        # though it mattered killed a live turn: the player was already in
+        # `place:ambulance`, the resolver listed it again under a
+        # `place:houston` it never settled, and a turn that needed to commit
+        # nothing new was refused twice over a parent nobody was going to use.
         seen = {where}
-        parent = proposed.get(where)
+        parent = None if self.store.entity(where) is not None else proposed.get(where)
         while parent is not None and self.store.entity(parent) is None:
             if parent not in proposed:
                 raise ValueError(
@@ -608,6 +837,16 @@ class Resolver:
             "you_are_in": here,
             "present": [{"id": e.id, "kind": e.kind, "name": e.name} for e in present],
             "you_carry": [{"id": e.id, "name": e.name} for e in carried],
+            # Transient state (spec 2.1), the player's own first. It is small,
+            # it changes every turn, and a resolver that cannot see the
+            # character is standing on a table writes the next turn as though
+            # they were still on the floor.
+            "state_now": {
+                entity_id: lines
+                for entity_id in [PLAYER_ID] + [e.id for e in present]
+                for lines in [_state_lines(self.store, entity_id)]
+                if lines
+            },
         }
         if budget_tokens is None:
             budget_tokens = self.config.token_budgets["resolver"]

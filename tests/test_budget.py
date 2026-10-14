@@ -21,7 +21,7 @@ from worldsim.render import Narrator
 from worldsim.resolve import PLAYER_ID, Resolver
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 SPAWN = json.dumps(
     {
@@ -32,6 +32,8 @@ SPAWN = json.dumps(
             {"entity_id": "person:you", "key": "name", "value": "Dale Rusk", "source": "invented", "visibility": "obvious"}
         ],
         "player_starts_in": "place:bar",
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "opening_situation": "rent is late",
     }
 )
@@ -68,10 +70,12 @@ def test_a_long_game_does_not_grow_either_prompt(store, config, call_log):
     ]
     llm = FakeLLM(
         config, call_log,
-        # Two narrator lines per turn: a beat can be regenerated when every
-        # sentence of it repeats what the player was already told.
-        {"resolver": script,
-         "narrator": ["Quiet."] + [f"Line {n}." for n in range(turns * 3)]},
+        # Four narrator lines per turn is slack: a turn makes two calls, the
+        # attempt and the outcome, and either can be regenerated when every
+        # sentence of it repeats what the player was already told. The lines
+        # have to differ from each other, or the near-duplicate filter spends
+        # the regeneration on every single turn.
+        scripts(script, ["Quiet."] + [f"Line {n}." for n in range(turns * 4)]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -97,7 +101,7 @@ def test_a_long_game_does_not_grow_either_prompt(store, config, call_log):
 
 def test_the_room_survives_the_trim_and_the_far_past_is_what_goes(store, config, call_log):
     """Priority order, not an arbitrary cut: what is here outlives what is not."""
-    llm = FakeLLM(config, call_log, {"resolver": [SPAWN], "narrator": ["Quiet."]})
+    llm = FakeLLM(config, call_log, scripts([SPAWN], ["Quiet."]))
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
     begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))

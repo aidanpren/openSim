@@ -25,7 +25,7 @@ from worldsim.render import Narrator
 from worldsim.resolve import PLAYER_ID, Resolver
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 SPAWN = json.dumps(
     {
@@ -36,6 +36,8 @@ SPAWN = json.dumps(
             {"entity_id": "person:you", "key": "cash_usd", "value": 20, "source": "invented", "visibility": "noticeable"}
         ],
         "player_starts_in": "place:kitchen",
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "opening_situation": "rent is late",
     }
 )
@@ -95,7 +97,7 @@ def test_the_narrator_runs_before_the_stream_has_finished(store, config, call_lo
         new_facts=[["place:kitchen", "ticket_rail", "three tickets deep"]],
     )
     llm = OrderTrackingLLM(
-        config, call_log, {"resolver": [SPAWN, turn_reply], "narrator": ["Oil ticks.", "Coins on the counter."]}
+        config, call_log, scripts([SPAWN, turn_reply], ["Oil ticks.", "Coins on the counter."])
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -116,7 +118,7 @@ def test_the_narrator_runs_before_the_stream_has_finished(store, config, call_lo
 def test_time_to_scene_is_logged_separately_from_the_whole_call(store, config, call_log):
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, reply(player_location="place:kitchen")], "narrator": ["Oil ticks.", "Quiet."]},
+        scripts([SPAWN, reply(player_location="place:kitchen")], ["Oil ticks.", "Quiet."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -138,7 +140,7 @@ def test_a_bad_scene_is_retried_and_never_committed(store, config, call_log):
     good = reply(player_location="place:kitchen", summary="fine")
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, nonsense, good], "narrator": ["Oil ticks.", "Quiet."]},
+        scripts([SPAWN, nonsense, good], ["Oil ticks.", "Quiet."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -158,7 +160,7 @@ def test_a_reply_with_no_complete_object_fails_cleanly(store, config, call_log):
     truncated = '{"intent": "walk", "duration_minutes": 2, "player_loc'
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, truncated, truncated], "narrator": ["Oil ticks.", "x"]},
+        scripts([SPAWN, truncated, truncated], ["Oil ticks.", "x"]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -173,8 +175,7 @@ def test_a_reply_with_no_complete_object_fails_cleanly(store, config, call_log):
 def test_prose_instead_of_json_fails_cleanly(store, config, call_log):
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, "Sure! Here is what happens.", "Still no JSON."],
-         "narrator": ["Oil ticks.", "x"]},
+        scripts([SPAWN, "Sure! Here is what happens.", "Still no JSON."], ["Oil ticks.", "x"]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -195,7 +196,7 @@ def test_the_llm_layer_raises_ledger_failed_distinctly(store, config, call_log):
     half_bad = reply(player_location="place:kitchen").replace(
         "{}", '{"deltas": "not a list"}'
     )
-    llm = FakeLLM(config, call_log, {"resolver": [half_bad], "narrator": []})
+    llm = FakeLLM(config, call_log, scripts([half_bad], []))
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     store.add_entity("place:kitchen", "place", "The line")
 
@@ -238,10 +239,10 @@ def drive(store, config, call_log, make_error, failures):
     llm = FlakyStreamLLM(
         config,
         call_log,
-        {
-            "resolver": [SPAWN, reply(player_location="place:kitchen")],
-            "narrator": ["Oil ticks.", "The pit is backed up."],
-        },
+        scripts(
+            [SPAWN, reply(player_location="place:kitchen")],
+            ["Oil ticks.", "You lean over the pit.", "The pit is backed up."],
+        ),
         make_error,
         failures,
     )
@@ -258,7 +259,7 @@ def test_a_transient_status_reopens_the_stream(store, config, call_log, monkeypa
 
     result = turn.play("I look at the pit", life)
 
-    assert result.narration == "The pit is backed up."
+    assert result.narration == "You lean over the pit. The pit is backed up."
     assert llm.opens == 2
 
 
@@ -286,7 +287,9 @@ def test_an_in_flight_budget_on_the_stream_is_retried(store, config, call_log, m
 
     llm, turn, life = drive(store, config, call_log, in_flight, 1)
 
-    assert turn.play("I look at the pit", life).narration == "The pit is backed up."
+    assert turn.play("I look at the pit", life).narration == (
+        "You lean over the pit. The pit is backed up."
+    )
     assert llm.opens == 2
 
 
@@ -300,7 +303,10 @@ def test_a_failed_stream_is_logged_and_commits_nothing(store, config, call_log, 
         turn.play("I look at the pit", life)
 
     assert store.now() == before
-    assert [r.ok for r in call_log.records] == [False, False]
+    # The attempt is spoken before the resolver is called, so it is on the
+    # record and it succeeded; both resolver attempts then failed, and nothing
+    # the turn would have committed was committed.
+    assert [r.ok for r in call_log.records] == [True, False, False]
 
 
 def test_a_number_where_a_superseded_value_should_be_text_is_accepted(store, config, call_log):
@@ -321,7 +327,10 @@ def test_an_unusable_ledger_still_delivers_the_narration(store, config, call_log
     )
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, half_bad], "narrator": ["Oil ticks.", "The pit is backed up."]},
+        scripts(
+            [SPAWN, half_bad],
+            ["Oil ticks.", "You lean over the pit.", "The pit is backed up."],
+        ),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -330,10 +339,10 @@ def test_an_unusable_ledger_still_delivers_the_narration(store, config, call_log
 
     result = turn.play("I look at the pit", life)
 
-    assert result.narration == "The pit is backed up."
+    assert result.narration == "You lean over the pit. The pit is backed up."
     assert any("ledger unusable" in item for item in result.dropped)
     # The turn is still on the record, so the next turn has continuity.
-    assert store.recent_turns(life.id, limit=1)[0]["narration"] == "The pit is backed up."
+    assert store.recent_turns(life.id, limit=1)[0]["narration"] == result.narration
 
 
 # ---- the compact wire format ----
@@ -421,7 +430,10 @@ def test_a_scene_of_compact_facts_commits_normally(store, config, call_log):
     # person:gary has no entity, so that fact is dropped, not crashed on.
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, compact_turn], "narrator": ["Oil ticks.", "Stale beer."]},
+        scripts(
+            [SPAWN, compact_turn],
+            ["Oil ticks.", "You push the door open.", "Stale beer."],
+        ),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -433,7 +445,7 @@ def test_a_scene_of_compact_facts_commits_normally(store, config, call_log):
     assert store.entity("place:tavern").name == "The Double Luck"
     assert store.live_fact("place:tavern", "smell").value == "stale beer"
     assert store.entity(PLAYER_ID).location_id == "place:tavern"
-    assert result.narration == "Stale beer."
+    assert result.narration == "You push the door open. Stale beer."
 
 
 # ---- the splitter reads a growing buffer once ----
@@ -491,7 +503,7 @@ def test_a_ledger_followed_by_a_closing_fence_is_still_read(store, config, call_
         )
         + "\n```\nHope that helps!"
     )
-    llm = FakeLLM(config, call_log, {"resolver": [SPAWN, fenced], "narrator": ["Oil ticks.", "Change."]})
+    llm = FakeLLM(config, call_log, scripts([SPAWN, fenced], ["Oil ticks.", "Change."]))
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
     turn = Turn(store, resolver, narrator, random.Random(7))
@@ -516,7 +528,7 @@ def test_a_rejected_scene_is_still_logged_as_a_call(store, config, call_log):
     good = reply(player_location="place:kitchen")
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, unusable, good], "narrator": ["Oil ticks.", "You are there."]},
+        scripts([SPAWN, unusable, good], ["Oil ticks.", "You are there."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)

@@ -19,7 +19,7 @@ from worldsim.render import BIOGRAPHY, Narrator, narrated_the_player
 from worldsim.resolve import PLAYER_ID, Resolver
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 SPAWN = json.dumps(
     {
@@ -34,13 +34,15 @@ SPAWN = json.dumps(
             {"entity_id": "place:kitchen", "key": "smell", "value": "old frying oil", "source": "invented", "visibility": "obvious"},
         ],
         "player_starts_in": "place:kitchen",
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "opening_situation": "rent was due four days ago",
     }
 )
 
 
 def build(store, config, call_log, resolver_script, narrator_script):
-    llm = FakeLLM(config, call_log, {"resolver": resolver_script, "narrator": narrator_script})
+    llm = FakeLLM(config, call_log, scripts(resolver_script, narrator_script))
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
     return llm, resolver, narrator, Turn(store, resolver, narrator, random.Random(7))
@@ -358,6 +360,12 @@ def test_the_narrator_is_never_given_the_players_own_words(store, config, call_l
     back as "You say you'll have a beer, please" — twice, through a
     regeneration. It gets the resolver's one-line intent now, so the phrasing
     it was echoing is not in the prompt at all.
+
+    The attempt beat is the one deliberate exception, and it has to be: it is
+    written before anything is resolved, so the player's own line is the only
+    thing it has, and telling the declared action is the whole of its job. It
+    is also the one beat with nothing to read back, because nothing has been
+    said yet.
     """
     said = "I lean over and tell her the money is coming on Friday, I swear"
     turn_reply = reply(
@@ -369,7 +377,7 @@ def test_the_narrator_is_never_given_the_players_own_words(store, config, call_l
     )
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, turn_reply], "narrator": ["Quiet.", "She doesn't look up from the glass."]},
+        scripts([SPAWN, turn_reply], ["Quiet.", "She doesn't look up from the glass."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -379,13 +387,17 @@ def test_the_narrator_is_never_given_the_players_own_words(store, config, call_l
 
     turn.play(said, life)
 
-    narrator_prompts = [user for role, _, user in llm.prompts if role == "narrator"]
-    assert narrator_prompts
-    for prompt in narrator_prompts:
+    after_the_attempt = [
+        user
+        for role, system, user in llm.prompts
+        if role == "narrator" and "Say the attempt" not in system
+    ]
+    assert after_the_attempt
+    for prompt in after_the_attempt:
         assert "I swear" not in prompt
         assert said not in prompt
     # The resolver's reading of it does get through, so a question still lands.
-    assert "promise the bartender the money on Friday" in narrator_prompts[-1]
+    assert "promise the bartender the money on Friday" in after_the_attempt[-1]
 
 
 # ---- defect 1, the second time (found live, playtest-20261011) ----
@@ -416,8 +428,7 @@ def test_a_destination_whose_parent_does_not_exist_is_refused(store, config, cal
     )
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, unreachable, recovered],
-         "narrator": ["Quiet.", "The door closes behind you."]},
+        scripts([SPAWN, unreachable, recovered], ["Quiet.", "The door closes behind you."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -439,7 +450,7 @@ def test_the_reason_reaches_the_model_on_the_retry(store, config, call_log):
     )
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, unreachable, unreachable], "narrator": ["Quiet."]},
+        scripts([SPAWN, unreachable, unreachable], ["Quiet."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -470,7 +481,7 @@ def test_an_entity_off_to_one_side_is_reparented_not_lost(store, config, call_lo
     )
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN, with_orphan], "narrator": ["Quiet.", "The fryer ticks."]},
+        scripts([SPAWN, with_orphan], ["Quiet.", "You wait.", "The fryer ticks."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -481,7 +492,7 @@ def test_an_entity_off_to_one_side_is_reparented_not_lost(store, config, call_lo
 
     assert store.entity("place:orphan").location_id == "place:spawn-city"
     assert any("place:orphan" in item and "instead" in item for item in result.dropped)
-    assert result.narration == "The fryer ticks."
+    assert result.narration == "You wait. The fryer ticks."
 
 
 # ---- the ledger arrives too late to retry, so it takes both forms ----

@@ -18,7 +18,7 @@ from worldsim.render import Narrator
 from worldsim.resolve import PLAYER_ID, NewFact, Resolver, Supersede, is_quantity
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 
 def a_fact(key, value):
@@ -73,6 +73,8 @@ SPAWN_WITH_STRING_CASH = json.dumps(
             {"entity_id": "person:you", "key": "name", "value": "Ethan Carter", "source": "invented", "visibility": "obvious"},
             {"entity_id": "person:you", "key": "cash_usd", "value": "27", "source": "invented", "visibility": "noticeable"},
         ],
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "player_starts_in": "place:diner",
         "opening_situation": "rent is late",
     }
@@ -88,7 +90,7 @@ BUY_CIGARETTES = reply(
 
 
 def build(store, config, call_log, resolver_script, narrator_script):
-    llm = FakeLLM(config, call_log, {"resolver": resolver_script, "narrator": narrator_script})
+    llm = FakeLLM(config, call_log, scripts(resolver_script, narrator_script))
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
     return resolver, narrator, Turn(store, resolver, narrator, random.Random(7))

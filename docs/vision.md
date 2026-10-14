@@ -48,7 +48,7 @@ That's why this isn't a pile of features. Every detail is a consequence of the w
 Every design decision answers to these.
 
 - **Freedom with weight.** You can try anything, and everything costs something. There's no undo or reload, and the dice are real. When a character dies, they stay dead, and you begin again as someone new.
-- **Situations, not quests.** There are no objectives, markers, or checklists. Every life starts as somebody specific, with wants of their own and something standing in the way of them. That friction isn't the same as hardship: a rich man's daughter with an allowance and no say in anything has it, and so does a mechanic whose brother keeps borrowing the van. How comfortable a life starts is drawn, and both extremes are rare. What you want grows out of who you turned out to be, and you decide what's worth chasing.
+- **Situations, not quests.** There are no objectives, markers, or checklists. Every life starts as somebody specific, in the middle of something that's already happening, with wants of their own and something standing in the way of them. The van has to be back at the yard by six; the locks were changed this morning. Nothing points at it and you can walk away, and it plays out without you. That friction isn't the same as hardship: a rich man's daughter with an allowance and no say in anything has it, and so does a mechanic whose brother keeps borrowing the van. How comfortable a life starts is drawn, and both extremes are rare. What you want grows out of who you turned out to be, and you decide what's worth chasing.
 - **The world goes on.** Time moves, and people live their own lives whether or not you're watching. Ignore someone for months and they act on it. Even death doesn't reset it: your next life might walk past the store your last one burned.
 - **You are a person, not an avatar.** Your character has a history, skills, a body, and people who know them. Who they are shapes what you notice and how things go.
 - **Imagination is the screen.** The narration says what matters, not everything. Sound sets the mood without drawing the picture: the hum of a casino floor, wind along a desert fence. Images would overwrite what your mind builds.
@@ -64,7 +64,7 @@ The fastest way to ruin this is to make it feel like a game.
 - **Not GTA.** A playground where nothing remembers you is a toy, not a world.
 - **Not a quest log.** No markers, missions, XP bars, or "objective complete."
 - **Not a pile of features.** If a detail needs its own system, the foundation is wrong.
-- **Not contrived.** No drama manufactured to entertain you, no world out to get you, no plot armor.
+- **Not contrived.** No drama from nowhere, no world out to get you, no plot armor. Lives are chosen to be interesting; after that, every consequence has a cause.
 - **Not a yes-man.** The world doesn't bend to please you. A plan works because it exploits something real, not because you said it with confidence.
 - **Not a narrator who describes everything.** Every sentence should earn its place.
 - **Not screen-first.** Images and menus pull you out of the world you're imagining.

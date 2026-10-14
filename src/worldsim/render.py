@@ -20,15 +20,32 @@ from .resolve import PLAYER_ID, Line
 from .sheet import time_of_day
 from .store import Entity, Known, Store
 
-# Prompts have not held this line, so it is checked in code. Speech and
-# interior states only: "you feel the cold" is a sensation the world caused and
-# is allowed, and so is "you walk in", which is the world confirming an action.
-PUTS_WORDS_IN_YOUR_MOUTH = re.compile(
+# Prompts have not held this line, so it is checked in code. What it catches is
+# narrowly what the player did not give: words they never said, choices they
+# never made, feelings nobody read off them. The action they *did* declare is
+# the narrator's job to tell — "you muster your strength and jump onto the
+# table" is the voice this is for, not a breach — and a sensation the world
+# causes, like cold or pain, was always allowed.
+#
+# This used to be one pattern, and it flagged every narration of the player's
+# speech. So "You say you'll have a beer" was blocked even on a turn where the
+# player had said exactly that, and the contract read as "never describe the
+# player's action at all".
+INVENTED_SPEECH = re.compile(
     r"\byou(?:'re|'ve)?\s+(?:"
     r"say|says|said|tell|tells|told|ask|asks|asked|reply|replies|replied|"
     r"answer|answers|answered|shout|shouts|shouted|yell|yells|yelled|"
     r"mutter|mutters|muttered|whisper|whispers|whispered|explain|explains|"
-    r"explained|admit|admits|admitted|insist|insists|insisted|"
+    r"explained|admit|admits|admitted|insist|insists|insisted"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Always a breach unless the player's own words asked for it: these are the
+# inside of someone else's head, and the one thing the vision reserves for the
+# player is what their character decides, thinks, and feels.
+MIND_AND_CHOICE = re.compile(
+    r"\byou(?:'re|'ve)?\s+(?:"
     r"decide|decides|decided|think|thinks|thought|realize|realizes|realized|"
     r"wonder|wonders|wondered|remember|remembers|remembered|hope|hopes|hoped|"
     r"want|wants|wanted|choose|chooses|chose|believe|believes|believed|"
@@ -45,6 +62,55 @@ PUTS_WORDS_IN_YOUR_MOUTH = re.compile(
 CANNOT_BELIEVE = re.compile(r"\byou\s+can'?t\s+believe\b", re.IGNORECASE)
 
 WORDS = re.compile(r"[A-Za-z']+")
+
+# Enough of a stemmer to tell whether the player used the verb the narrator
+# just used. "I nod at him" has to make "you nod at him" legal, or the gate
+# refuses the one thing step 2b asks the narrator to do.
+IRREGULAR = {
+    "said": "say", "says": "say", "told": "tell", "tells": "tell",
+    "thought": "think", "thinks": "think", "chose": "choose",
+    "chooses": "choose", "replies": "reply", "replied": "reply",
+}
+
+
+def _stem(word: str) -> str:
+    plain = word.lower().strip("'")
+    if plain in IRREGULAR:
+        return IRREGULAR[plain]
+    for suffix in ("ing", "ied", "ed", "es", "s"):
+        if plain.endswith(suffix) and len(plain) - len(suffix) >= 3:
+            plain = plain[: -len(suffix)]
+            break
+    if len(plain) > 3 and plain[-1] == plain[-2]:
+        plain = plain[:-1]  # nodd -> nod, grinn -> grin
+    if len(plain) > 4 and plain.endswith("e"):
+        plain = plain[:-1]  # circle -> circl, to meet circling
+    return plain
+
+
+# Words too common to say two sentences are the same thing. Without this the
+# near-duplicate score is carried by "the" and "a".
+STOPWORDS = frozenset(
+    {"a", "an", "the", "of", "in", "on", "at", "to", "into", "from", "with",
+     "and", "but", "or", "as", "is", "are", "was", "were", "be", "it", "its",
+     "you", "your", "yours", "there", "here", "that", "this", "s", "t"}
+)
+
+# Tuned on the pair finding 5 left open: "the fluorescent light above flickers"
+# against "the fluorescent light above the sink flickers" scores 0.80, and
+# sentences that genuinely say different things about the same room score well
+# under half. Exact repeats were already caught; paraphrases were not.
+SAME_THING_SAID_TWICE = 0.7
+SENTENCES_REMEMBERED = 6
+
+# A sentence that says nothing the earlier one didn't is a repeat however it
+# scores. "You turn in the driver's seat and look back through the cab at the
+# gurney" followed by "You look back through the cab at the gurney" scores 0.63
+# — under the threshold, because the longer sentence dilutes the overlap — and
+# went out live, one beat after the other. Three content words is the floor, so
+# "the door opens" after a long sentence about the door still counts and "the
+# fridge hums" is left alone.
+NOTHING_NEW_IN_IT = 3
 
 # A "you <verb>" inside someone else's clause is not the narrator speaking for
 # the player: "Gary asks what you want" is Gary's line. The bare pattern above
@@ -117,11 +183,6 @@ def _split_sentence(buffer: str) -> tuple[str | None, str]:
     return None, buffer
 
 
-def _normalise(sentence: str) -> str:
-    """A sentence reduced to its words, for comparing one beat against another."""
-    return " ".join(WORDS.findall(sentence.lower()))
-
-
 def sentences_in(text: str | None) -> list[str]:
     """Every sentence in `text`, in order."""
     out, buffer = [], text or ""
@@ -135,21 +196,96 @@ def sentences_in(text: str | None) -> list[str]:
     return out
 
 
-def _sentences(text: str | None) -> frozenset[str]:
-    """Every sentence in `text`, normalised. Empty for None."""
-    return frozenset(_normalise(s) for s in sentences_in(text))
+def _content(sentence: str) -> frozenset[str]:
+    """What a sentence is actually about, for comparing it with another.
+
+    Stemmed, because the two sentences that say the same thing rarely inflect
+    it the same way. "You step out onto the pavement, circling the vehicle"
+    against "You step out onto the pavement and circle the vehicle" differed by
+    `circling` against `circle` alone, and went out one beat after the other.
+    """
+    return frozenset(
+        _stem(word)
+        for word in WORDS.findall(sentence.lower())
+        if word not in STOPWORDS
+    )
 
 
-def narrated_the_player(text: str) -> list[str]:
-    """Phrases that put words or thoughts in the player's mouth."""
+class Heard:
+    """The last few sentences the player has actually been told.
+
+    Exact repeats were already filtered; paraphrases were not, which is how
+    "the fluorescent light above flickers" came back as "the fluorescent light
+    above the sink flickers" a turn later. This compares what two sentences are
+    about rather than their wording, and it is deterministic — no model call
+    sits between a sentence and the speaker.
+    """
+
+    def __init__(self, spoken: list[str] | tuple[str, ...] = ()) -> None:
+        self.said: list[frozenset[str]] = []
+        for text in spoken:
+            self.remember(text)
+
+    def remember(self, text: str | None) -> None:
+        for sentence in sentences_in(text):
+            content = _content(sentence)
+            if content:
+                self.said.append(content)
+        self.said = self.said[-SENTENCES_REMEMBERED:]
+
+    def is_repeat(self, sentence: str) -> bool:
+        content = _content(sentence)
+        if not content:
+            return False
+        for earlier in self.said:
+            overlap = len(content & earlier)
+            union = len(content | earlier)
+            if union and overlap / union >= SAME_THING_SAID_TWICE:
+                return True
+            # Or it is wholly contained in something already said, either way
+            # round: the longer one said all of it and more.
+            if len(content) >= NOTHING_NEW_IN_IT and content <= earlier:
+                return True
+            if len(earlier) >= NOTHING_NEW_IN_IT and earlier <= content:
+                return True
+        return False
+
+
+def narrated_the_player(
+    text: str, declared: str | None = None, spoke: bool = False
+) -> list[str]:
+    """Phrases that put words, choices or feelings in the player's mouth.
+
+    `declared` is what the player actually gave this turn: their own line. A
+    verb they used themselves is theirs, so narrating it back is the contract
+    rather than a breach — "I nod" has to permit "you nod", or the gate blocks
+    the one thing step 2b asks the narrator to do.
+
+    `spoke` is whether the resolver settled that they said something aloud. If
+    they did, their speech may be voiced, quoted, or reported, and only the
+    *invention* of speech is a breach. If they said nothing, every "you say" is
+    an invention.
+    """
+    gave = {_stem(word) for word in WORDS.findall(declared or "")}
+    patterns = [MIND_AND_CHOICE, CANNOT_BELIEVE]
+    if not spoke:
+        patterns.insert(0, INVENTED_SPEECH)
     found = []
-    for pattern in (PUTS_WORDS_IN_YOUR_MOUTH, CANNOT_BELIEVE):
+    for pattern in patterns:
         for match in pattern.finditer(text):
             before = WORDS.findall(text[: match.start()])
             if before and before[-1].lower() in SOMEONE_ELSE_IS_SPEAKING:
                 continue
+            verbs = {_stem(word) for word in WORDS.findall(match.group(0))}
+            if verbs & gave:
+                continue  # the player used this word; it is theirs to be told
             found.append(match.group(0))
     return found
+
+
+def _state_of(store: Store, entity_id: str) -> dict:
+    """An entity's transient state, as plain key-to-value (spec 2.1)."""
+    return {held.key: held.value for held in store.state(entity_id)}
 
 
 class Narrator:
@@ -174,6 +310,8 @@ class Narrator:
         already_said: str | None = None,
         recently_said: str | None = None,
         budget_tokens: int | None = None,
+        different_now: list[str] | None = None,
+        how_it_went: str | None = None,
     ) -> dict:
         """What the narrator is allowed to see. Nothing else reaches it.
 
@@ -196,7 +334,20 @@ class Narrator:
         ]
         # People before scenery, so a crowded room drops the furniture.
         here_now.sort(key=lambda e: (e.kind != "person", e.id))
-        present = [{"id": e.id, "name": e.name, "kind": e.kind} for e in here_now]
+        # How the people here are standing comes with them. Transient state is
+        # only ever what is apparent to anyone present — anything secret is a
+        # fact with a visibility — so it needs no filtering of its own beyond
+        # `_can_make_out`, which has already dropped whatever the character
+        # cannot notice at all.
+        present = [
+            {
+                "id": e.id,
+                "name": e.name,
+                "kind": e.kind,
+                **({"state": state} if (state := _state_of(self.store, e.id)) else {}),
+            }
+            for e in here_now
+        ]
 
         noticed = set(noticed_fact_ids)
         context = {
@@ -224,6 +375,18 @@ class Narrator:
             "you_carry": [
                 {"id": e.id, "name": e.name} for e in self.store.contents(PLAYER_ID)
             ],
+            # The character's own transient state (spec 2.1): standing on the
+            # table, out of breath, a bottle in hand. They know their own body,
+            # so this reaches them unfiltered — unlike anyone else's, which is
+            # only here because being in the room with somebody is enough to
+            # see how they are standing.
+            "your_state": _state_of(self.store, PLAYER_ID),
+            # What the action left different: what they can now see, reach, or
+            # do. Code assembles it from what was actually committed, which is
+            # what keeps rule 1 true of the one sentence the turn closes on.
+            "different_now": different_now or [],
+            # How close the roll was, in words. Never the number (spec 3.2).
+            "how_it_went": how_it_went,
             "dialogue": [
                 {"speaker": self._name(line.speaker_id), "says": line.gist}
                 for line in dialogue
@@ -295,9 +458,16 @@ class Narrator:
         """
         if entity.id in known_of:
             return True
-        return any(
+        if any(
             fact.visibility != "hidden" for fact in self.store.live_facts(entity.id)
-        )
+        ):
+            return True
+        # Transient state counts, because it is by definition what anyone in
+        # the room can see. Without this the fact/state split made people
+        # vanish: a roommate whose only settled detail was his mood had that
+        # routed to state, was left with no visible fact, and stopped being in
+        # the room at all.
+        return bool(self.store.state(entity.id))
 
     def _name(self, entity_id: str) -> str:
         entity = self.store.entity(entity_id)
@@ -315,6 +485,10 @@ class Narrator:
         recently_said: str | None = None,
         max_sentences: int | None = None,
         on_text: Callable[[str], None] | None = None,
+        declared: str | None = None,
+        different_now: list[str] | None = None,
+        how_it_went: str | None = None,
+        heard: Heard | None = None,
     ) -> str:
         """Narrate, streamed a sentence at a time, and gated on the contract.
 
@@ -341,17 +515,24 @@ class Narrator:
                 - estimate_tokens(system)
                 - RETRY_ROOM
                 - SEAM,
+                different_now=different_now,
+                how_it_went=how_it_went,
             )
         )
 
-        # What the first beat already said, so the second cannot say it again.
+        # What this player has already been told, so no beat says it twice.
         # `already_told_you` asks the model not to repeat itself and a live turn
         # repeated the whole paragraph word for word anyway, so the gate holds
-        # the line instead of the prompt.
-        said_before = _sentences(already_said) | _sentences(recently_said)
+        # the line instead of the prompt. The caller owns the window when it has
+        # one, because it spans turns.
+        said_before = heard if heard is not None else Heard()
+        said_before.remember(already_said)
+        said_before.remember(recently_said)
+        spoke = bool(said_aloud)
 
         accepted, broke_first, all_repeats = self._speak(
-            system, user, on_text, said_before=said_before, limit=max_sentences
+            system, user, on_text, said_before=said_before, limit=max_sentences,
+            declared=declared, spoke=spoke,
         )
         if all_repeats:
             # Nothing was delivered, so there is still a choice here. A live
@@ -361,7 +542,7 @@ class Narrator:
             accepted, broke_first, _ = self._speak(
                 system, user + REPEATED, on_text,
                 said_before=said_before, limit=max_sentences,
-                repeat_if_empty=True,
+                repeat_if_empty=True, declared=declared, spoke=spoke,
             )
         if not broke_first:
             return accepted
@@ -372,7 +553,8 @@ class Narrator:
         retry = user + CORRECTION.format(found=", ".join(sorted(set(broke_first))))
         accepted, broke_again, _ = self._speak(
             system, retry, on_text, gate=False, said_before=said_before,
-            limit=max_sentences, repeat_if_empty=True,
+            limit=max_sentences, repeat_if_empty=True, declared=declared,
+            spoke=spoke,
         )
         if broke_again:
             self.breaches.append(
@@ -386,9 +568,11 @@ class Narrator:
         user: str,
         on_text: Callable[[str], None] | None,
         gate: bool = True,
-        said_before: frozenset[str] = frozenset(),
+        said_before: Heard | None = None,
         limit: int | None = None,
         repeat_if_empty: bool = False,
+        declared: str | None = None,
+        spoke: bool = False,
     ) -> tuple[str, list[str], bool]:
         """Stream one narration, clearing it a sentence at a time.
 
@@ -402,6 +586,7 @@ class Narrator:
         blocked: list[str] = []
         repeats: list[str] = []
         stopped = False
+        heard = said_before if said_before is not None else Heard()
 
         def take(chunk: str) -> None:
             nonlocal buffer, stopped
@@ -411,16 +596,17 @@ class Narrator:
                 if sentence is None:
                     return
                 buffer = rest
-                if _normalise(sentence) in said_before:
+                if heard.is_repeat(sentence):
                     repeats.append(sentence)
                     continue  # already said; held in case nothing else lands
-                broke = narrated_the_player(sentence)
+                broke = narrated_the_player(sentence, declared, spoke)
                 if broke:
                     blocked.extend(broke)
                     if gate:
                         stopped = True
                         raise StopNarration
                 accepted.append(sentence)
+                heard.remember(sentence)
                 if on_text is not None:
                     on_text(sentence)
                 if limit is not None and len(accepted) >= limit:
@@ -437,15 +623,16 @@ class Narrator:
         if not stopped:
             # Whatever is left has no terminator; it is still a sentence.
             tail = buffer.strip()
-            if tail and _normalise(tail) in said_before:
+            if tail and heard.is_repeat(tail):
                 repeats.append(tail)
                 tail = ""
             if tail:
-                broke = narrated_the_player(tail)
+                broke = narrated_the_player(tail, declared, spoke)
                 if broke:
                     blocked.extend(broke)
                 if not broke or not gate:
                     accepted.append(tail)
+                    heard.remember(tail)
                     if on_text is not None:
                         on_text(tail)
 

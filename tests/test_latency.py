@@ -24,7 +24,7 @@ from worldsim.render import Narrator, _split_sentence
 from worldsim.resolve import PLAYER_ID, Ledger, Opening, Resolver, Scene
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 SPAWN = json.dumps(
     {
@@ -35,6 +35,8 @@ SPAWN = json.dumps(
             {"entity_id": "person:you", "key": "name", "value": "Dale Rusk", "source": "invented", "visibility": "obvious"}
         ],
         "player_starts_in": "place:kitchen",
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "opening_situation": "rent is late",
     }
 )
@@ -81,7 +83,7 @@ class Timeline(FakeLLM):
 
 def build(store, config, call_log, resolver_script, narrator_script):
     llm = Timeline(
-        config, call_log, {"resolver": resolver_script, "narrator": narrator_script}
+        config, call_log, scripts(resolver_script, narrator_script)
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -208,11 +210,13 @@ def test_the_second_beat_is_told_what_the_first_already_said(store, config, call
     assert result.narration == "Stale beer and fryer oil. Gary looks up from the counter."
 
 
-def test_a_turn_with_nothing_new_to_add_stays_one_beat(store, config, call_log):
-    """Cost control: the second narrator call only happens when it earns itself.
+def test_a_turn_is_two_beats_and_no_more(store, config, call_log):
+    """Cost control: a turn makes exactly two narrator calls (spec 3.1).
 
-    The character walks somewhere, which is worth a beat, and the scene adds
-    nobody and says nothing, which is not.
+    The attempt, spoken before the resolver is called at all, and the outcome,
+    spoken when the scene closes. There used to be a beat per object with a
+    guard on each, and the guard on the opening was the repetition the player
+    reported: with nothing new to say it said the room again.
     """
     through_the_door = (
         json.dumps(
@@ -229,33 +233,47 @@ def test_a_turn_with_nothing_new_to_add_stays_one_beat(store, config, call_log):
     )
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, through_the_door],
-        ["Oil ticks.", "Cold air, and the smell of rain off the asphalt."],
+        [
+            "Oil ticks.",
+            "You push the back door open.",
+            "Cold air, and the smell of rain off the asphalt.",
+        ],
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     result = turn.play("I step out back", life)
 
     prompts = [user for role, _, user in llm.prompts if role == "narrator"]
-    assert len(prompts) == 2, "one for the spawn, one for the turn"
-    assert result.narration == "Cold air, and the smell of rain off the asphalt."
+    assert len(prompts) == 3, "the spawn, then the attempt and the outcome"
+    assert result.narration == (
+        "You push the back door open. Cold air, and the smell of rain off the asphalt."
+    )
     assert store.entity(PLAYER_ID).location_id == "place:alley"
+    # The attempt is written before anything is resolved, so it can only have
+    # been given what the character already knew: no alley, no rain.
+    assert "alley" not in prompts[1]
 
 
 # ---- every turn says something ----
 
 
 def test_a_turn_that_settles_nothing_still_speaks(store, config, call_log):
-    """The beat guards skip empty narration; this is the floor underneath them."""
+    """A turn that settles nothing and goes nowhere still has to answer.
+
+    Paying for the beer already in your hand: no new fact, no move, no roll.
+    The outcome beat is the floor, and it fires whether or not the scene gave
+    it anything.
+    """
     nothing = reply(player_location="place:kitchen", summary="you pay")
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, nothing],
-        ["Oil ticks.", "Coins go across the counter."],
+        ["Oil ticks.", "You count out the bills.", "Coins go across the counter."],
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
     result = turn.play("I pay for the beer", life)
 
-    assert result.narration == "Coins go across the counter."
+    assert result.narration == "You count out the bills. Coins go across the counter."
 
 
 # ---- sentence gating ----
@@ -280,7 +298,7 @@ def test_sentences_are_delivered_as_they_clear(store, config, call_log):
     """Each one goes out the moment it is checked, not at the end."""
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN], "narrator": ["The door gives. Stale beer inside. Gary looks up."]},
+        scripts([SPAWN], ["The door gives. Stale beer inside. Gary looks up."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -294,8 +312,7 @@ def test_sentences_are_delivered_as_they_clear(store, config, call_log):
 def test_a_breach_in_the_first_sentence_is_caught_before_it_is_spoken(store, config, call_log):
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN],
-         "narrator": ["You say you'll have a beer. The glass lands.", "The glass lands on the bar."]},
+        scripts([SPAWN], ["You say you'll have a beer. The glass lands.", "The glass lands on the bar."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -319,8 +336,7 @@ def test_a_breach_later_on_truncates_instead_of_regenerating(store, config, call
     """
     llm = FakeLLM(
         config, call_log,
-        {"resolver": [SPAWN],
-         "narrator": ["The glass lands on the bar. You decide to drink it."]},
+        scripts([SPAWN], ["The glass lands on the bar. You decide to drink it."]),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -406,9 +422,22 @@ def test_the_instructions_stay_small():
         path.name: estimate_tokens(path.read_text())
         for path in PROMPTS_DIR.glob("*.md")
     }
-    assert sizes["resolver.md"] < 2000, sizes
-    assert sizes["narrator.md"] < 1050, sizes
-    assert sizes["spawn.md"] < 1700, sizes
+    # Raised in the feel pass, deliberately, and this is what earned it.
+    # resolver.md: the fact/state split, what an action leaves different, the
+    # input mode, the timeline, cut/linger/thread. narrator.md: the narration
+    # contract rewritten. spawn.md: secrets, the clock, varied premises. About
+    # 0.1c a turn, against a 2c budget, and the alternative was leaving the
+    # playtest findings unfixed.
+    assert sizes["resolver.md"] < 2700, sizes
+    # narrator.md was raised a second time, in the same pass, for the one
+    # defect the first playtest of it found: the outcome beat re-narrating the
+    # attempt. Worth a hundred tokens, because the player notices it first.
+    assert sizes["narrator.md"] < 1450, sizes
+    assert sizes["spawn.md"] < 2600, sizes
+    # The two beats of a turn have their own prompts, and both stay small on
+    # purpose: the attempt is one sentence and an answer is one line.
+    assert sizes["attempt.md"] < 600, sizes
+    assert sizes["answer.md"] < 600, sizes
     # The opening narration is a one-off at spawn, so it can afford to be long,
     # but nothing should quietly become the biggest file.
     assert max(sizes.values()) == sizes["resolver.md"], sizes
@@ -499,32 +528,70 @@ def test_more_facts_about_the_same_room_do_not_earn_a_second_beat(store, config,
     )
     llm, resolver, narrator, turn = build(
         store, config, call_log, [SPAWN, more_kitchen],
-        ["Oil ticks.", "Clean laminate, and wooden cabinets above the sink."],
+        [
+            "Oil ticks.",
+            "You turn and take the room in.",
+            "Clean laminate, and wooden cabinets above the sink.",
+        ],
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
 
-    turn.play("What's in this kitchen?", life)
+    turn.play("I look around the kitchen properly", life)
 
     prompts = [u for role, _, u in llm.prompts if role == "narrator"]
-    assert len(prompts) == 2, "the kitchen was described once, not twice"
-    # The scene's fact still landed and is still perceived; it just waits for
-    # the next thing that is worth saying out loud.
+    assert len(prompts) == 3, "the kitchen was described once, not twice"
+    # Both of the turn's facts landed, and both reach the one outcome beat
+    # rather than earning a beat each.
     assert store.live_fact("place:kitchen", "cabinets") is not None
+    assert "cabinets" in prompts[2] and "counters" in prompts[2]
 
 
-def test_normalising_catches_a_repeat_that_is_not_byte_identical():
-    from worldsim.render import _normalise, _sentences
+def test_a_paraphrase_of_something_already_said_is_dropped(store, config, call_log):
+    """Finding 5: exact repeats were caught, paraphrases were not.
 
-    assert _normalise("Stale beer, and fryer oil!") == _normalise("stale beer and fryer oil")
-    assert _sentences("One thing. Two things.") == frozenset({"one thing", "two things"})
-    assert _sentences(None) == frozenset()
+    Tuned on the pair the 30-turn run left open. Sentences that genuinely say
+    different things about the same room score well under the threshold, so the
+    filter does not eat the narration.
+    """
+    from worldsim.render import Heard
+
+    heard = Heard(["The fluorescent light above flickers."])
+    assert heard.is_repeat("The fluorescent light above the sink flickers.")
+    assert heard.is_repeat("the fluorescent light above flickers")  # and exact ones
+    assert not heard.is_repeat("The fridge hums, and the window is dark.")
+    assert not heard.is_repeat("Gary sets a pint down without a word.")
+
+    # Both of these went out live, one beat after the other, in the first
+    # playtest of the attempt-then-outcome shape. The first is a strict subset
+    # of what was already said, and scores under the threshold because the
+    # longer sentence dilutes the overlap. The second differed by `circling`
+    # against `circle` alone, which is why the comparison is stemmed.
+    said = Heard(
+        [
+            "You turn in the driver's seat and look back through the cab at the gurney.",
+            "You open the car door and step out onto the pavement, circling the"
+            " vehicle with your camera in hand.",
+        ]
+    )
+    assert said.is_repeat("You look back through the cab at the gurney.")
+    assert said.is_repeat(
+        "You step out onto the pavement and circle the vehicle, camera in hand."
+    )
+    # And the sentences those turns should have had instead are left alone.
+    assert not said.is_repeat("The metal gives a dull pop under your weight.")
+    assert not said.is_repeat("Papers, a manual, a small flashlight.")
+
+    # Only the last few sentences are remembered, so a place can be described
+    # again on a later visit.
+    heard = Heard([f"Sentence number {n} about nothing." for n in range(20)])
+    assert len(heard.said) == 6
 
 
-def test_a_turn_never_runs_past_four_sentences(store, config, call_log):
-    """Spec 4's limit is for the whole turn, not for each beat.
+def test_a_turn_never_runs_past_its_allowance(store, config, call_log):
+    """Length follows the moment (spec 4), and the voice ceiling is hard.
 
     Two beats of "two to four sentences" made six-sentence turns in a live run.
-    The allowance is spent across the beats, and the gate stops the second one
+    The allowance is spent across the beats, and the gate stops the outcome
     when it runs out.
     """
     with_gary = (
@@ -548,14 +615,15 @@ def test_a_turn_never_runs_past_four_sentences(store, config, call_log):
     )
     llm = FakeLLM(
         config, call_log,
-        {
-            "resolver": [SPAWN, with_gary],
-            "narrator": [
+        scripts(
+            [SPAWN, with_gary],
+            [
                 "Oil ticks.",
-                "Stale beer. The lights are low. A television mutters. Someone laughs.",
-                "Gary looks up. He sets down the rag. He waits. The rail is three deep.",
+                "You push through the door. It swings back behind you.",
+                "Gary looks up. He sets down the rag. He waits. The rail is three deep."
+                " Somebody laughs at the far end. A television mutters.",
             ],
-        },
+        ),
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -566,12 +634,15 @@ def test_a_turn_never_runs_past_four_sentences(store, config, call_log):
     result = turn.play("I walk in", life, on_text=spoken.append)
 
     from worldsim.render import sentences_in
+    from worldsim.turn import ATTEMPT_SENTENCES, CHARGED_TURN
 
-    assert len(sentences_in(result.narration)) <= 4, result.narration
-    assert len(spoken) <= 4, spoken
-    # The first beat spent the whole allowance, so the second was never called.
-    assert spoken[0] == "Stale beer."
-    assert [u for role, _, u in llm.prompts if role == "narrator"].__len__() == 2
+    # Gary speaks, so this is a charged turn and gets the whole ceiling — and
+    # not a sentence past it, because the ceiling is what a voice can hold.
+    assert len(sentences_in(result.narration)) <= CHARGED_TURN, result.narration
+    assert len(spoken) <= CHARGED_TURN, spoken
+    # The attempt is one sentence, whatever the model sends.
+    assert spoken[:1] == ["You push through the door."]
+    assert len(sentences_in(result.narration)) > ATTEMPT_SENTENCES
 
 
 def test_dedup_never_silences_a_turn(store, config, call_log):

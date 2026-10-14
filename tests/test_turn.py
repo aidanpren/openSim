@@ -13,7 +13,7 @@ from worldsim.resolve import PLAYER_ID, STATIONS, Resolver, draw_station
 from worldsim.sheet import character_sheet
 from worldsim.turn import Turn, begin_life
 from worldsim.__main__ import PROMPTS_DIR, local_time
-from helpers import reply
+from helpers import IN_MOTION_SCHEDULE, IN_MOTION_SECRETS, reply, scripts
 
 HIDDEN_VALUE = "a revolver taped under the bar"
 
@@ -30,6 +30,8 @@ SPAWN = json.dumps(
             {"entity_id": "place:spawn-city", "key": "timezone", "value": "America/Chicago", "source": "world-knowledge", "visibility": "obvious"},
             {"entity_id": "person:marisol", "key": "under_the_bar", "value": HIDDEN_VALUE, "source": "invented", "visibility": "hidden"},
         ],
+        "secrets": IN_MOTION_SECRETS,
+        "schedule": IN_MOTION_SCHEDULE,
         "opening_situation": "rent was due four days ago",
     }
 )
@@ -73,7 +75,7 @@ CERTAIN_TURN = reply(
 
 def build(store, config, call_log, resolver_script, narrator_script, seed=7):
     llm = FakeLLM(
-        config, call_log, {"resolver": resolver_script, "narrator": narrator_script}
+        config, call_log, scripts(resolver_script, narrator_script)
     )
     resolver = Resolver(llm, store, config, PROMPTS_DIR)
     narrator = Narrator(llm, store, config, PROMPTS_DIR)
@@ -296,14 +298,18 @@ def test_nested_places_land_even_when_listed_child_first(store, config, call_log
 
 def test_a_turn_is_logged_for_resuming(store, config, call_log):
     llm, resolver, narrator, turn = build(
-        store, config, call_log, [SPAWN, CERTAIN_TURN], ["Quiet.", "You arrive."]
+        store, config, call_log,
+        [SPAWN, CERTAIN_TURN],
+        # A turn narrates twice: the attempt, then the outcome.
+        ["Quiet.", "You set off down the block.", "You arrive."],
     )
     life, _ = begin_life(store, resolver, narrator, config.spawn_city, random.Random(7))
     turn.play("I walk to the bar", life)
 
     rows = store.recent_turns(life.id, limit=10)
     assert [row["intent"] for row in rows] == ["spawn", "walk to the bar"]
-    assert rows[-1]["narration"] == "You arrive."
+    assert rows[-1]["narration"] == "You set off down the block. You arrive."
+    assert rows[-1]["mode"] == "action"
 
 
 def test_a_concealed_thing_in_the_room_never_reaches_the_narrator(store, config, call_log):
@@ -324,6 +330,8 @@ def test_a_concealed_thing_in_the_room_never_reaches_the_narrator(store, config,
                 {"entity_id": "person:you", "key": "name", "value": "Dale Rusk", "source": "invented", "visibility": "obvious"},
                 {"entity_id": "person:roommate", "key": "mood", "value": "sullen", "source": "invented", "visibility": "obvious"},
             ],
+            "secrets": IN_MOTION_SECRETS,
+            "schedule": IN_MOTION_SCHEDULE,
             "player_starts_in": "place:apt",
             "opening_situation": "rent is late",
         }
@@ -348,6 +356,8 @@ def test_perceiving_it_is_what_makes_it_narratable(store, config, call_log):
             "new_facts": [
                 {"entity_id": "thing:revolver", "key": "condition", "value": "oiled, recently", "source": "invented", "visibility": "hidden"}
             ],
+            "secrets": IN_MOTION_SECRETS,
+            "schedule": IN_MOTION_SCHEDULE,
             "player_starts_in": "place:apt",
             "opening_situation": "rent is late",
         }
@@ -418,6 +428,8 @@ def test_a_fact_hidden_from_you_is_not_yours_to_know(store, config, call_log):
                 {"entity_id": "person:you", "key": "cash_usd", "value": 27, "source": "invented", "visibility": "noticeable"},
                 {"entity_id": "person:you", "key": "warrant", "value": "a bench warrant in Jackson County, unserved", "source": "invented", "visibility": "hidden"},
             ],
+            "secrets": IN_MOTION_SECRETS,
+            "schedule": IN_MOTION_SCHEDULE,
             "player_starts_in": "place:apt",
             "opening_situation": "rent is late",
         }
@@ -504,13 +516,14 @@ def test_the_weights_are_a_distribution():
 # ---- transient state is not a fact (playtest-20261011, top finding) ----
 
 
-def test_state_that_changes_every_turn_is_refused(store, config, call_log):
+def test_momentary_state_is_never_a_fact(store, config, call_log):
     """Facts are permanent (rule 3), so momentary state has no business being one.
 
     A live run settled `posture = "sitting on a bench"` on the player. A later
     turn proposing a new value was refused as a duplicate rather than treated
     as a change, so it still said that after they had walked home — and nothing
-    could correct it.
+    could correct it. Transient state is its own table now, and a model that
+    still writes it as a fact has it routed there rather than dropped.
     """
     stateful = reply(
         intent="walk home",
@@ -532,19 +545,32 @@ def test_state_that_changes_every_turn_is_refused(store, config, call_log):
 
     result = turn.play("I walk home", life)
 
-    for refused in ("posture", "activity", "location"):
-        assert store.live_fact(PLAYER_ID, refused) is None
-        assert any(refused in item for item in result.dropped)
+    # Nothing momentary reached the facts table, where rule 3 would freeze it.
+    for momentary in ("posture", "activity"):
+        assert store.live_fact(PLAYER_ID, momentary) is None
+    # Where something is stays the store's job, and is dropped outright.
+    assert store.live_fact(PLAYER_ID, "location") is None
     assert store.live_fact("place:bar", "occupants") is None
+    for structural in ("location", "occupants"):
+        assert any(structural in item for item in result.dropped)
+    # Posture was kept, as state, and is in the turn's record of what changed.
+    assert store.state_of(PLAYER_ID, "activity") == "eating pickles from the jar"
+    assert any("activity" in line for line in result.changed_state)
     # And the durable one landed.
     assert store.live_fact(PLAYER_ID, "condition").value == "a broken wrist, splinted"
 
 
-def test_where_something_is_stays_the_store_s_job():
-    from worldsim.resolve import not_a_fact
+def test_the_fact_or_state_boundary():
+    """Would it still be true tomorrow if nobody did anything? (spec 2.1)"""
+    from worldsim.resolve import is_transient, not_a_fact
 
+    # No: current state, overwritten freely.
+    for momentary in ("posture", "activity", "in_hand", "mood", "vantage"):
+        assert is_transient(momentary), momentary
+    # Yes: a fact, kept forever and superseded with a cause.
+    for durable in ("name", "job", "condition", "wearing", "carrying", "cash_usd"):
+        assert not is_transient(durable), durable
+        assert not_a_fact(durable) is None, durable
+    # And neither: the store already models where things are.
     assert not_a_fact("location") and "location" in not_a_fact("location")
-    assert not_a_fact("posture") and "permanent" in not_a_fact("posture")
-    # The sheet's own keys are untouched.
-    for keeper in ("name", "job", "condition", "wearing", "carrying", "cash_usd"):
-        assert not_a_fact(keeper) is None, keeper
+    assert not_a_fact("occupants")

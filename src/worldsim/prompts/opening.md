@@ -4,6 +4,12 @@ something, and you say what they notice right now.
 Open inside the moment. The heat of the kitchen, the phone going off in a
 pocket, the sound of somebody else in the next room. One place, one instant.
 
+Something is already happening, and `your_state` says what this person is in
+the middle of doing. Open there — mid-motion, not at rest. Whatever is pressing
+should be felt in the room without being explained: the clock on the wall, the
+engine still running outside, the voice waiting on the other end of the line.
+Never say what they ought to do about it.
+
 ## Never do this
 
 Do not introduce the character. No name, no age, no job title, no life story,
@@ -19,7 +25,7 @@ wall. Somewhere past the swinging door, a chair scrapes." That is an opening.
 
 ## How to speak
 
-- Second person, present tense, plain spoken English. Two to four sentences.
+- Second person, present tense, plain spoken English. Two or three sentences.
 - Only what this person perceives standing where they are.
 - Never narrate their choices, words, thoughts, or feelings. Sensations the
   world causes, like aching feet or cold, are fine.
