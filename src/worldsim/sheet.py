@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .resolve import PLAYER_ID, SPAWN_PLACE_ID
+from .resolve import PLAYER_ID, SPAWN_PLACE_ID, is_transient
 from .store import Store
 
 # Known keys, grouped. Anything the world settles under another key still shows,
@@ -34,11 +34,18 @@ def character_sheet(store: Store) -> str:
     a fact hidden from this character has no business on their own sheet, and
     where they hold a false belief, the belief is what they would tell you.
     """
+    # Transient keys are skipped, which only matters for a world created
+    # before the split (spec 2.1). Those hold facts like `posture = "sitting
+    # on a bench"` that were frozen by rule 3 and can never change, so the
+    # sheet showed a character sitting on a park bench in her own kitchen,
+    # eating pickles, three days later. They are not true and they cannot be
+    # corrected; the current value is in the state table, where it belongs.
     facts = {
         held.fact.key: held
         for held in store.known(PLAYER_ID)
-        if held.fact.entity_id == PLAYER_ID
+        if held.fact.entity_id == PLAYER_ID and not is_transient(held.fact.key)
     }
+    live = {held.key: held.value for held in store.state(PLAYER_ID)}
     used: set[str] = set()
     lines: list[str] = []
 
@@ -68,6 +75,14 @@ def character_sheet(store: Store) -> str:
         used.update(k for k in facts if any(h in k.lower() for h in THREAD_HINTS))
         lines.append("Open threads")
         lines.extend(threads)
+        lines.append("")
+
+    if live:
+        lines.append("Right now")
+        lines.extend(
+            f"  {key.replace('_', ' ')}: {_show(value)}"
+            for key, value in sorted(live.items())
+        )
         lines.append("")
 
     people = _people_you_know(store)

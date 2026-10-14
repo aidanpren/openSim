@@ -61,11 +61,19 @@ def main(argv: list[str]) -> int:
     call_log = CallLog(config.logs_dir / "calls.jsonl")
     store = Store(config.saves_dir / f"playtest-{name}" / "world.db")
     llm = OpenRouterLLM(config, call_log)
-    resolver = Resolver(llm, store, config, PROMPTS_DIR)
-    narrator = Narrator(llm, store, config, PROMPTS_DIR)
-    turn = Turn(store, resolver, narrator, random.Random())
+    corrections = config.corrections
+    resolver = Resolver(llm, store, config, PROMPTS_DIR, corrections)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR, corrections)
+    turn = Turn(store, resolver, narrator, random.Random(), corrections)
 
-    lines: list[str] = [f"# Playtest: {name}, {stamp}", ""]
+    arm = "raw" if config.corrections.all_off else "corrected"
+    model = llm.model_for("resolver")
+    lines: list[str] = [
+        f"# Playtest: {name}, {stamp}",
+        "",
+        f"`{arm}` arm, {model}.",
+        "",
+    ]
     firsts: list[float] = []
 
     def note(text: str = "") -> None:
@@ -87,6 +95,7 @@ def main(argv: list[str]) -> int:
         life, opening = begin_life(
             store, resolver, narrator, config.spawn_city, random.Random(),
             premises_path=config.logs_dir / "premises.txt",
+            corrections=corrections,
         )
         note(f"Spawned in {time.monotonic() - started:.1f}s. {local_time(store)}.")
         note()
@@ -158,7 +167,27 @@ def main(argv: list[str]) -> int:
          f"{call_log.total_cents() / turns:.2f}c a turn")
     note(f"- calls: {len(call_log.records)}, "
          f"{len(call_log.records) / turns:.1f} a turn")
+    note(f"- arm: {arm}, on {model}")
     note(f"- contract breaches that survived a regeneration: {narrator.breaches}")
+    # In the raw arm nothing blocks a breach, so counting them afterwards is
+    # the whole measurement: this is what the gate would have caught.
+    if config.corrections.all_off:
+        from worldsim.render import Heard, narrated_the_player, sentences_in as _in
+
+        breaches, repeats, seen = [], [], Heard()
+        for row in store.recent_turns(life.id, limit=1000):
+            for sentence in _in(row["narration"]):
+                if narrated_the_player(sentence, row["player_said"]):
+                    breaches.append(sentence)
+                if seen.is_repeat(sentence):
+                    repeats.append(sentence)
+                seen.remember(sentence)
+        note(f"- sentences the gate would have blocked: {len(breaches)}")
+        for item in breaches[:5]:
+            note(f"  - {item}")
+        note(f"- sentences the filter would have dropped: {len(repeats)}")
+        for item in repeats[:5]:
+            note(f"  - {item}")
     note()
     note("## Timeline still ahead")
     note()

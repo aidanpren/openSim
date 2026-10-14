@@ -149,9 +149,23 @@ class _BaseLLM:
     def __init__(self, config: Config, call_log: CallLog) -> None:
         self.config = config
         self.call_log = call_log
+        # Spec 12's light mode. Mutable, because `/light` flips it mid-session
+        # and Config is frozen; this is the only thing in the engine that
+        # changes after construction, and it changes nothing about the world.
+        self.light = config.light
         # (input_tokens, output_tokens) from the most recent stream, which the
         # provider only reports once generation has finished.
         self._stream_usage: tuple[int, int] = (0, 0)
+
+    def model_for(self, role: str) -> str:
+        """Which model this call actually runs on.
+
+        One place, so the log, the cost, and the request can never disagree
+        about it. In light mode every role runs on the background model.
+        """
+        if self.light:
+            return self.config.model_for("background")
+        return self.config.model_for(role)
 
     def _raw(self, role: str, model: str, system: str, user: str) -> tuple[str, int, int]:
         """Return (text, input_tokens, output_tokens)."""
@@ -197,7 +211,7 @@ class _BaseLLM:
         raise ModelCallFailed(f"{role} call failed: {exc}") from exc
 
     def _call(self, role: str, system: str, user: str, attempt: int) -> str:
-        model = self.config.model_for(role)
+        model = self.model_for(role)
         for transport_try in (1, 2):
             started = time.monotonic()
             try:
@@ -321,7 +335,7 @@ class _BaseLLM:
                 user = user + "\n\n" + RETRY_PREAMBLE.format(
                     error=str(error)[:MAX_ERROR_CHARS]
                 )
-            model = self.config.model_for(role)
+            model = self.model_for(role)
             streamed = _Streamed()
 
             for transport_try in (1, 2):
@@ -408,7 +422,7 @@ class _BaseLLM:
         call between the player and the first word. `on_chunk` may raise
         `StopNarration` to abandon the rest.
         """
-        model = self.config.model_for(role)
+        model = self.model_for(role)
         for transport_try in (1, 2):
             started = time.monotonic()
             text = ""

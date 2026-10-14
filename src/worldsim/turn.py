@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Callable
 
+from .config import Corrections
 from .llm import LedgerFailed
 from .modes import ACTION, QUESTION, SPEECH, classify
 from .render import BIOGRAPHY, Heard, Narrator, sentences_in as _sentences_in
@@ -174,11 +175,13 @@ class Turn:
         resolver: Resolver,
         narrator: Narrator,
         rng: random.Random,
+        corrections: Corrections | None = None,
     ) -> None:
         self.store = store
         self.resolver = resolver
         self.narrator = narrator
         self.rng = rng
+        self.corrections = corrections or Corrections()
 
     def play(
         self,
@@ -723,6 +726,12 @@ class Turn:
         posture written for where they have arrived must not be cleared by the
         arrival.
         """
+        if not self.corrections.route_writes:
+            # Raw mode: the model is taken at its word, so a posture written as
+            # a fact lands as one and freezes there under rule 3. That is the
+            # breakage this arm of the experiment is measuring, not a bug in
+            # it — do not play a world you want to keep in raw.
+            return []
         return self._state(
             [
                 StateChange(
@@ -743,9 +752,9 @@ class Turn:
         """
         landed = []
         for proposed in new_facts:
-            if is_transient(proposed.key):
+            if self.corrections.route_writes and is_transient(proposed.key):
                 continue
-            refusal = not_a_fact(proposed.key)
+            refusal = not_a_fact(proposed.key) if self.corrections.route_writes else None
             if refusal is not None:
                 # Dropped rather than retried: this arrives in the opening, and
                 # the player should not wait three seconds for a key the world
@@ -820,7 +829,7 @@ class Turn:
         """Returns transient changes that arrived by the wrong channel."""
         rerouted = []
         for change in superseded:
-            if is_transient(change.key):
+            if self.corrections.route_writes and is_transient(change.key):
                 # A supersession of something transient. There is nothing to
                 # supersede — state keeps no history — so this is just the new
                 # value, by the wrong door. A live turn put down a pair of
@@ -918,6 +927,7 @@ def begin_life(
     rng: random.Random,
     on_text: Callable[[str], None] | None = None,
     premises_path=None,
+    corrections: Corrections | None = None,
 ) -> tuple[Life, str]:
     """Spawn a character and narrate the opening (build step 4, spec 9).
 
@@ -941,7 +951,7 @@ def begin_life(
     avoid = recent_premises(premises_path) if premises_path else []
     spawned = resolver.spawn(draw_station(rng), avoid)
     dropped: list[str] = []
-    turn = Turn(store, resolver, narrator, rng)
+    turn = Turn(store, resolver, narrator, rng, corrections)
     noticed = []
 
     # A spawn is one world or none of it: half a life is not playable.

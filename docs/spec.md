@@ -41,6 +41,8 @@ The person a fact is about is one of the people it hides from. On a fact about t
 
 **Rule:** Quantities like cash and counts change by deltas that code applies. A model never writes a new total.
 
+A world created before this split carries facts under transient keys — `posture`, `activity`, `frustration` — frozen by the rule above and impossible to correct. They are read-time filtered out of the sheet and the narrator's context rather than deleted, because rule 3 does not bend for inconvenience. The live value comes from the state table instead.
+
 #### Facts and transient state
 
 Not everything true right now is a fact. One question decides which half of the store something belongs in:
@@ -120,6 +122,16 @@ Each object commits before the beat that speaks it, so rule 1 holds throughout. 
 
 The resolver is also told `input_mode` (section 3.0) and `happening_now`, which is whatever the clock has just fired (section 6.2).
 
+#### A journey has to arrive
+
+`duration_minutes` and `player_location` have to agree. If the clock moves by the journey, the character arrived; if they only got as far as the van, the clock moves by the minute that took.
+
+**Rule:** Code refuses an opening where the player said they were going somewhere, the clock moves by more than it takes to cross a room, and they end where they started. The refusal spends the spec 3.3 retry with the reason attached.
+
+All three conditions are needed, and that narrowness is the point: walking around a car is a travel verb and a minute, and sleeping until morning is eight hours in one spot. Only a declared journey that *also* billed for the travel is a contradiction.
+
+A live turn drove a delivery across town, resolved the first half of the action — set down the mail, grab the keys — charged twenty-two minutes for the drive, and committed the back room the character was already standing in. Code took it, because that was a real place. The next turn looked around "the venue" and found her work table. A turn that bills for a journey it didn't commit puts the world in the wrong place, and every turn after it inherits the error.
+
 #### What the action changed
 
 The resolver says what the action changed **for the player**: what they can now see, reach, or do that they couldn't a moment ago. It travels as transient `state` on them, or as facts they now perceive, and the narrator closes the turn on it.
@@ -147,6 +159,10 @@ An outcome holds superseding facts, quantity deltas, moves (who and what is now 
 - Where a real procedure exists, code runs it with real odds instead of using one probability: roulette, blackjack, slot machines, dice games. These can wait until milestone 6.
 - The resolver writes both outcomes before the roll. Code rolls with a seedable `random.Random` and commits the matching branch.
 - Code knows how close the roll was, and bands the margin into words: barely, with some effort, easily; by a hair, clearly, badly. The narrator is given the band and never the number, so a near miss sounds like one. A near miss that reads exactly like a hopeless one is the same turn twice, and the difference between them is most of what makes a risk feel like a risk.
+
+**Rule:** The player declares attempts, never results. An input that claims its own outcome — "I successfully get the money", "I slip past unnoticed" — is resolved as the attempt inside it, and code refuses an opening that marks such a turn certain. The refusal spends the spec 3.3 retry. It does not demand failure; it demands the question go to the dice, which is the only honest answer to a player who has written their own ending.
+
+This is the vision's "not a yes-man" in code. A live session typed "I successfuly get the money into my account" and the world agreed, with no roll, twice — twenty billion dollars into a social media manager's current account. Confidence is not evidence. Odds come from the character's skill, access and tools, and scale is part of them: ten dollars from a till and ten million from a ledger are not one action with a different number in it.
 
 **Rule:** No model sees a roll before both outcomes exist. Every roll is logged with its odds, both outcomes, and the result.
 
@@ -371,6 +387,10 @@ Prices are from [OpenRouter's Nous Research page](https://openrouter.ai/nousrese
 
 Every role needs a low-refusal model, because the resolver handles the same actions the narrator describes. The engine adds no content filters or refusals of its own; what the world allows is up to the configured model.
 
+**Light mode** runs every role on `BACKGROUND_MODEL`, which is a third of the price. It adds no model name to code and could not: the cheap model is already configured, so this is a remap of roles onto models `.env` already names. `LIGHT_MODE` sets it at launch and `/light` toggles it mid-session, taking effect on the next call so no turn is half one model and half another. `llm.model_for(role)` is the single place that decides, so the request, the log, and the cost can never disagree about which model ran.
+
+It is a development convenience, not a cheaper way to play. The freedom test found the 70B breaking the narration contract in six of ten responses. Code now gates a breach and regenerates rather than speaking it, but a regeneration is a second call — so a loose run can cost more than the model it was meant to undercut. The session says which model it is on at launch, and `/cost` says it again.
+
 Rough cost per turn at the play defaults, before OpenRouter's fee on credit purchases:
 
 | Call | Input tokens | Output tokens | Cost |
@@ -397,7 +417,8 @@ A terminal loop: the player types and the narration prints. Commands start with 
 - `/quit`: save, summarize the session, and exit
 - `/sheet`: show the character sheet
 - `/time`: show the local date and time where the character is
-- `/cost`: show this session's spend
+- `/cost`: show this session's spend, and the per-turn average
+- `/light`: toggle light mode (section 12)
 - `/dice`: toggle an inline roll readout, like `(d20: 16, needed 9)`. Off by default, printed and never spoken. It's a reading of the roll that already happened, inverted because code rolls low-is-good, and it never contradicts the branch that was committed.
 - `/dev`: toggle the dev view (section 13.5)
 
@@ -436,6 +457,22 @@ The dev view is hidden during normal play. It shows the truth at the current pla
   - **Lives:** ending a life leaves every world fact unchanged.
   - **Sandbox:** playing in a sandbox leaves the original world's files byte-identical.
 - Playtest transcripts go to `logs/playtests/` and are reviewed against the narration contract (section 4).
+
+### 14.1 The raw arm
+
+There are two kinds of code here and they are easy to confuse.
+
+One kind keeps the store coherent: the clock only moves forward, a fact needs an entity to live on, a quantity changes by a delta, the narrator's context is *built from* knowledge rows so a hidden fact has no path in. None of that is a judgement. None of it is optional.
+
+The other kind second-guesses the model: did it narrate a thought the player never had, did it repeat itself, did it charge for a journey it never committed, did it agree with a player who wrote their own ending. Those are judgements, every one is an approximation, and every one has needed live tuning — a stemmer, a three-condition guard, a one-shot stand-down. Two have been wrong in play: a travel check that cost a turn, and a yes-man check that refused twice a turn the model had already handled correctly.
+
+Whether that second kind earns its keep is open. The argument against it is that the model being corrected is better at judgement than the regexes correcting it, and that a session in a plain chat window with none of this was more fun than a session with all of it. The argument for it is that nothing else holds the line at turn 300.
+
+`RAW_MODE`, and `/raw`, turn the second kind off and leave the first alone. `Corrections` in `config.py` names the four groups, so the answer can be partial: if raw plays better but breaks on one thing, that one group comes back.
+
+**How it is settled:** twenty turns each arm, same model, `scripts/playtest.py`, transcripts side by side. The raw transcript counts what the gate *would* have blocked and what the filter *would* have dropped, so the cost of removing them is a number rather than an impression. The thing being measured is whether the world is more fun to play, which only the player can read off it.
+
+A raw world keeps writes that cannot be corrected later — a posture written as a fact is frozen by rule 3 forever — so a raw save is an experiment, not a life.
 
 ## 15. Roadmap
 

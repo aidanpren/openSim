@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
@@ -216,3 +217,50 @@ def test_the_session_total_adds_up(config, call_log):
         sum(r.cost_cents for r in call_log.records)
     )
     assert call_log.total_cents() > 0
+
+
+# ---- light mode (spec 12) ----
+
+
+def test_light_mode_sends_every_role_to_the_background_model(config, call_log):
+    """A remap of roles, not a model name in code (CLAUDE.md's rule)."""
+    from dataclasses import replace
+
+    llm = FakeLLM(config, call_log, {"resolver": ["{}"], "narrator": ["x"]})
+    assert llm.model_for("resolver") == config.models["resolver"]
+    assert llm.model_for("narrator") == config.models["narrator"]
+
+    llm.light = True
+    cheap = config.models["background"]
+    for role in ("resolver", "narrator", "background"):
+        assert llm.model_for(role) == cheap, role
+
+    # And it can be the default, from .env rather than from a toggle.
+    lit = FakeLLM(replace(config, light=True), call_log, {})
+    assert lit.light
+    assert lit.model_for("resolver") == cheap
+
+
+def test_the_log_records_the_model_the_call_actually_ran_on(config, call_log):
+    """Rule 9: the log, the cost, and the request can never disagree."""
+    llm = FakeLLM(config, call_log, {"narrator": ["The fryer ticks."]})
+    llm.light = True
+
+    llm.text("narrator", "system", "user")
+
+    assert call_log.records[-1].model == config.models["background"]
+
+
+def test_no_model_name_is_written_in_code():
+    """Model names come from .env, so light mode may not smuggle one in."""
+    import worldsim
+
+    source = Path(worldsim.__file__).parent
+    offenders = [
+        path.name
+        for path in source.glob("*.py")
+        # config.py holds the price table, which is keyed on model ids and is
+        # not a choice of model (its own comment says so).
+        if path.name != "config.py" and "hermes" in path.read_text().lower()
+    ]
+    assert not offenders, offenders

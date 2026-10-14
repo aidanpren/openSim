@@ -36,6 +36,29 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 COULD_NOT_RESOLVE = "Sorry, that didn't come through. Say it again?"
 
+USAGE = """\
+    PYTHONPATH=src python -m worldsim [--new]
+
+      --new   start a new life in a new world, instead of resuming the most
+              recently played one under saves/
+
+Environment (see .env.example): LIGHT_MODE, RAW_MODE, VOICE_ENABLED."""
+
+COMMANDS = """\
+/help   this list
+/sheet  who you are, what you have, what is true right now
+/time   the local date and time where you are
+/cost   this session's spend
+/dice   show the roll inline, off by default
+/light  run every role on the cheap model
+/raw    take the model at its word: no gate, no filter, no refusals
+/dev    the dev view: the truth here, rolls, the timeline, dropped writes
+/quit   save and exit
+
+Anything else is said or done in the world. You can also ask the narrator
+about yourself — "what am I doing?", "where am I?", "what's in my pocket?" —
+which costs no time and settles nothing."""
+
 # How long the prompt will wait on the voice before deciding it is wedged, in
 # 0.2s polls. Short polls rather than one long block so Ctrl-C lands promptly.
 VOICE_PATIENCE = 450
@@ -181,7 +204,17 @@ def dev_view(
     return "\n".join(lines)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--help" in argv or "-h" in argv:
+        print(USAGE)
+        return 0
+    start_new = "--new" in argv
+    unknown = [a for a in argv if a not in ("--new",)]
+    if unknown:
+        print(f"Unknown option {unknown[0]!r}.\n\n{USAGE}", file=sys.stderr)
+        return 2
+
     try:
         config = load_config(REPO_ROOT)
     except ConfigError as exc:
@@ -190,7 +223,12 @@ def main() -> int:
 
     call_log = CallLog(config.logs_dir / "calls.jsonl")
 
-    resuming = latest_world(config.saves_dir)
+    # Resuming is the default because picking up where you stopped is the
+    # point of a persistent world. There was no way to say otherwise, though,
+    # so a new life meant moving save directories around by hand — and the
+    # newest world is whatever was touched last, which after a playtest is not
+    # the one anybody meant.
+    resuming = None if start_new else latest_world(config.saves_dir)
     if resuming:
         world_dir = resuming
     else:
@@ -199,18 +237,34 @@ def main() -> int:
 
     store = Store(world_dir / "world.db")
     llm = OpenRouterLLM(config, call_log)
-    resolver = Resolver(llm, store, config, PROMPTS_DIR)
-    narrator = Narrator(llm, store, config, PROMPTS_DIR)
+    # One object, built here and passed in, so which arm of the experiment a
+    # session ran on is a single readable thing rather than four scattered ifs.
+    corrections = config.corrections
+    resolver = Resolver(llm, store, config, PROMPTS_DIR, corrections)
+    narrator = Narrator(llm, store, config, PROMPTS_DIR, corrections)
     # One generator for the whole session: it draws the station a life starts
     # at and then every roll in it (rule 6).
     rng = random.Random()
-    turn = Turn(store, resolver, narrator, rng)
+    turn = Turn(store, resolver, narrator, rng, corrections)
     voice = Voice(
         enabled=config.voice_enabled,
         voice=config.voice_name,
         rate=config.voice_rate,
     )
     speak = make_speak(voice)
+
+    if corrections.all_off:
+        # Loud, because a raw world carries writes that cannot be corrected
+        # later: a posture written as a fact is frozen by rule 3 forever.
+        print(
+            "Raw mode: the model is taken at its word. The store, the dice and\n"
+            "rule 5 still hold; nothing else does. Do not play a world you want\n"
+            "to keep.\n"
+        )
+    if llm.light:
+        # Never a surprise which model is talking. A session that reads oddly
+        # should be traceable to this line rather than guessed at.
+        print(f"Light mode: every role on {llm.model_for('resolver')}.\n")
 
     life = store.current_life()
     if life is None:
@@ -220,6 +274,7 @@ def main() -> int:
             life, opening = begin_life(
                 store, resolver, narrator, config.spawn_city, rng, on_text=speak,
                 premises_path=config.logs_dir / "premises.txt",
+                corrections=corrections,
             )
         except (ModelCallFailed, StoreError) as exc:
             print(f"The world could not be started: {exc}", file=sys.stderr)
@@ -229,7 +284,13 @@ def main() -> int:
         print()
     else:
         past = store.recent_turns(life.id, limit=1)
-        print(f"Back in it. {local_time(store)}.\n")
+        # Which world, by name. Without it a resume is indistinguishable from
+        # a spawn until the narration contradicts what you expected, and after
+        # a playtest the newest save is rarely the one anybody meant.
+        print(
+            f"Back in it: {world_dir.name}. {local_time(store)}."
+            "  (--new for a new life)\n"
+        )
         if past and past[0]["narration"]:
             print(past[0]["narration"])
 
@@ -254,16 +315,25 @@ def main() -> int:
 
         if said.startswith("/"):
             command = said.split()[0].lower()
-            if command == "/quit":
+            if len(said.split()) > 1:
+                # `/dev I fly to mexico` toggled the view and silently ate the
+                # action, which reads as the world ignoring you.
+                print("\nCommands take no arguments; the rest was ignored.")
+            if command in ("/help", "/h", "/?"):
+                print("\n" + COMMANDS + "\n")
+            elif command == "/quit":
                 break
             elif command == "/sheet":
                 print("\n" + character_sheet(store) + "\n")
             elif command == "/time":
                 print(f"\n{local_time(store)}\n")
             elif command == "/cost":
+                turns = max(len(store.recent_turns(life.id, limit=1000)) - 1, 1)
                 print(
                     f"\n{len(call_log.records)} calls, "
-                    f"{call_log.total_cents():.2f} cents this session\n"
+                    f"{call_log.total_cents():.2f} cents this session, "
+                    f"{call_log.total_cents() / turns:.2f} a turn"
+                    f"{' (light)' if llm.light else ''}\n"
                 )
             elif command == "/dev":
                 dev = not dev
@@ -271,10 +341,41 @@ def main() -> int:
             elif command == "/dice":
                 dice = not dice
                 print(f"\ndice {'shown' if dice else 'hidden'}\n")
-            else:
+            elif command == "/raw":
+                # One object shared by the resolver, the narrator and the turn,
+                # so flipping it here flips it everywhere.
+                # Currently raw means switch them back on, and the other way
+                # round. Written the other way first, which made `/raw` set
+                # True when they were already True: a no-op that reported
+                # success.
+                on = corrections.all_off
+                corrections.refuse_turns = on
+                corrections.gate_narration = on
+                corrections.drop_repeats = on
+                corrections.route_writes = on
+                print(f"\nraw mode {'on' if corrections.all_off else 'off'}\n")
+                if corrections.all_off:
+                    print(
+                        "The store, the dice and rule 5 still hold. Nothing is"
+                        " second-guessing the model now, and a write it puts in"
+                        " the wrong place stays there.\n"
+                    )
+            elif command == "/light":
+                # Takes effect on the next call, so the turn in flight is not
+                # half one model and half another.
+                llm.light = not llm.light
                 print(
-                    "\nNo such command. Try /sheet, /time, /cost, /dice, /dev, /quit.\n"
+                    f"\nlight mode {'on' if llm.light else 'off'}: "
+                    f"{llm.model_for('resolver')}\n"
                 )
+                if llm.light:
+                    print(
+                        "The cheap model is looser with the narration contract."
+                        " A blocked sentence costs a regeneration, so a bad run"
+                        " can end up no cheaper. Watch /cost.\n"
+                    )
+            else:
+                print(f"\nNo such command.\n\n{COMMANDS}\n")
             continue
 
         # The voice loads while the resolver thinks, so the first sentence is

@@ -527,7 +527,10 @@ def test_momentary_state_is_never_a_fact(store, config, call_log):
     """
     stateful = reply(
         intent="walk home",
-        player_location="place:spawn-city",
+        # A real destination. Written as the spawn city before, which with the
+        # travel check in place is the finding-4 contradiction: a declared walk
+        # home that bills for the walk and ends where it started.
+        player_location="place:bar",
         summary="you walk",
         new_facts=[
             ["person:you", "posture", "sitting on a bench"],

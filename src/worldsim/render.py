@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Callable
 
 from .budget import SEAM, as_prompt, estimate_tokens, take_within
-from .config import Config
+from .config import Config, Corrections
 from .llm import StopNarration, _BaseLLM
-from .resolve import PLAYER_ID, Line
+from .resolve import PLAYER_ID, Line, is_transient
 from .sheet import time_of_day
 from .store import Entity, Known, Store
 
@@ -290,12 +290,18 @@ def _state_of(store: Store, entity_id: str) -> dict:
 
 class Narrator:
     def __init__(
-        self, llm: _BaseLLM, store: Store, config: Config, prompts_dir: Path
+        self,
+        llm: _BaseLLM,
+        store: Store,
+        config: Config,
+        prompts_dir: Path,
+        corrections: Corrections | None = None,
     ) -> None:
         self.llm = llm
         self.store = store
         self.config = config
         self.prompts_dir = prompts_dir
+        self.corrections = corrections or Corrections()
         # Contract breaches that survived a regeneration, for the dev view. A
         # repeat offence used to be accepted silently.
         self.breaches: list[str] = []
@@ -318,7 +324,16 @@ class Narrator:
         `budget_tokens` is what is left for the context after the instructions
         (spec 5.2); None means the role's whole budget.
         """
-        known = [k for k in self.store.known(PLAYER_ID) if k.fact.key not in omit_keys]
+        # `is_transient` only excludes anything in a world made before the
+        # split (spec 2.1), where posture and the like were frozen as facts by
+        # rule 3. Those are stale and uncorrectable; the live value comes from
+        # the state table below instead, so the narrator is never told the
+        # character is sitting on a bench they left three days ago.
+        known = [
+            k
+            for k in self.store.known(PLAYER_ID)
+            if k.fact.key not in omit_keys and not is_transient(k.fact.key)
+        ]
 
         player = self.store.entity(PLAYER_ID)
         here = self.store.entity(player.location_id) if player.location_id else None
@@ -596,10 +611,14 @@ class Narrator:
                 if sentence is None:
                     return
                 buffer = rest
-                if heard.is_repeat(sentence):
+                if self.corrections.drop_repeats and heard.is_repeat(sentence):
                     repeats.append(sentence)
                     continue  # already said; held in case nothing else lands
-                broke = narrated_the_player(sentence, declared, spoke)
+                broke = (
+                    narrated_the_player(sentence, declared, spoke)
+                    if self.corrections.gate_narration
+                    else []
+                )
                 if broke:
                     blocked.extend(broke)
                     if gate:
@@ -623,11 +642,15 @@ class Narrator:
         if not stopped:
             # Whatever is left has no terminator; it is still a sentence.
             tail = buffer.strip()
-            if tail and heard.is_repeat(tail):
+            if tail and self.corrections.drop_repeats and heard.is_repeat(tail):
                 repeats.append(tail)
                 tail = ""
             if tail:
-                broke = narrated_the_player(tail, declared, spoke)
+                broke = (
+                    narrated_the_player(tail, declared, spoke)
+                    if self.corrections.gate_narration
+                    else []
+                )
                 if broke:
                     blocked.extend(broke)
                 if not broke or not gate:

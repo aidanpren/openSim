@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 from .budget import SEAM, as_prompt, estimate_tokens, take_within
-from .config import Config
+from .config import Config, Corrections
 from .llm import RETRY_ROOM, _BaseLLM
 from .store import Store
 
@@ -80,6 +81,57 @@ STRUCTURAL_KEYS = frozenset(
     {"location", "location_id", "whereabouts", "occupants", "contents",
      "inside", "contains"}
 )
+
+
+# A journey that takes real time has to end somewhere else. A live turn drove a
+# delivery across town, advanced the clock twenty-two minutes, and left the
+# character standing at her own work table — and code took it, because
+# `player_location` named a real place, just the wrong one. The next turn looked
+# around "the venue" and found her back room. Half a compound action resolved,
+# and nothing noticed.
+#
+# Both conditions are needed and that is the whole point. "I walk around the
+# car" is a travel verb and a minute, and ends where it began, correctly.
+# "I sleep until morning" is eight hours in one spot, correctly. Only a
+# declared journey that also billed for the travel is a contradiction.
+TRAVEL_MINUTES = 5
+
+TRAVELS = re.compile(
+    r"\b(?:go|goes|going|gone|head|heads|heading|walk|walks|walking|"
+    r"drive|drives|driving|drove|run|runs|running|ran|ride|rides|riding|rode|"
+    r"fly|flies|flying|flew|travel|travels|travelling|traveling|"
+    r"leave|leaves|leaving|left|return|returns|returning)\b",
+    re.IGNORECASE,
+)
+
+
+def declares_travel(said: str) -> bool:
+    """Whether the player said they were going somewhere."""
+    return bool(TRAVELS.search(said))
+
+
+# The player says what their character does. They do not say how it goes —
+# that is the world's to decide, and the vision's "not a yes-man" is exactly
+# this line. A live session typed "I successfuly get the money into my
+# account" and the world agreed, because the assertion arrived as if it were
+# the action.
+ASSERTS_OUTCOME = re.compile(
+    r"\b(?:"
+    r"succes+\w*|"                       # successful, successfully, succesfuly
+    r"manage[sd]? to|"
+    r"it works|and it works|"
+    r"without (?:a |any )?(?:problem|issue|trouble|hitch)|"
+    r"(?:no one|nobody|no-one) (?:sees|notices|stops|catches)|"
+    r"unnoticed|undetected|"
+    r"and (?:i|it) (?:get|gets|got) away"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def asserts_outcome(said: str) -> bool:
+    """Whether the player tried to settle the result of their own action."""
+    return bool(ASSERTS_OUTCOME.search(said))
 
 
 def is_transient(key: str) -> bool:
@@ -572,12 +624,18 @@ class Resolver:
     """Builds the resolver's context from the truth and asks for a decision."""
 
     def __init__(
-        self, llm: _BaseLLM, store: Store, config: Config, prompts_dir: Path
+        self,
+        llm: _BaseLLM,
+        store: Store,
+        config: Config,
+        prompts_dir: Path,
+        corrections: Corrections | None = None,
     ) -> None:
         self.llm = llm
         self.store = store
         self.config = config
         self.prompts_dir = prompts_dir
+        self.corrections = corrections or Corrections()
 
     def _prompt(self, name: str) -> str:
         return (self.prompts_dir / name).read_text()
@@ -719,13 +777,40 @@ class Resolver:
             else:
                 break  # the instructions alone are over; nothing left to give
         user = as_prompt(payload)
+        # Where they are before the turn, captured now: the opening's checks
+        # run before anything is committed, so the store still holds it, but
+        # only this frame knows it was the *starting* point.
+        player = self.store.entity(PLAYER_ID)
+        was_in = player.location_id if player else None
+
+        # The yes-man check gets one shot, then stands down. The other two are
+        # about coherence and a retry can always satisfy them; this one asks
+        # for a roll, and "certain failure" is a legitimate answer that looks
+        # identical from the opening — a barista has no path to ten million
+        # dollars and `uncertain:false` is the right call for that. Held
+        # strict, a model that read it that way lost the turn twice over and
+        # the player got "say it again" instead of a scene where they tried.
+        nudged: list[bool] = []
+
+        def check(opening: Opening) -> None:
+            # check_opening is not optional: it keeps the player somewhere that
+            # exists, which is the store's coherence rather than a judgement
+            # about the model.
+            self.check_opening(opening)
+            if not self.corrections.refuse_turns:
+                return
+            if not nudged:
+                nudged.append(True)
+                self.check_not_a_yes_man(opening, player_said)
+            self.check_travel(opening, player_said, was_in)
+
         opening, scene, ledger = self.llm.stream_objects(
             "resolver",
             system,
             user,
             (Opening, Scene, Ledger),
             on_object,
-            (self.check_opening, None, None),
+            (check, None, None),
         )
         return opening, scene, ledger
 
@@ -782,6 +867,68 @@ class Resolver:
                 )
             seen.add(parent)
             parent = proposed[parent]
+
+    def check_not_a_yes_man(self, opening: Opening, player_said: str) -> None:
+        """The player's confidence is not evidence (vision: not a yes-man).
+
+        They declare the attempt; the world decides how it goes. A live
+        session typed "I successfuly get the money into my account" and the
+        resolver committed it with `uncertain` false and no roll, because the
+        assertion arrived looking like the action.
+
+        Raising spends the spec 3.3 retry. It does not demand failure — it
+        demands that the question be put to the dice (rule 6), which is the
+        only honest answer to a player who has written their own ending.
+
+        It is asked once per turn and then stands down. Certain failure is a
+        real resolution and looks exactly like certain success from here, so a
+        model that answers "there is no path to this at all" is right, and
+        holding the line a second time only costs the player the turn.
+        """
+        if not asserts_outcome(player_said):
+            return
+        if opening.uncertain:
+            return  # already going to a roll, which is all this asks for
+        raise ValueError(
+            "The player's own words claim the attempt worked. That is not "
+            "theirs to decide and it is not evidence: they say what the "
+            "character does, the world says how it goes. Either the outcome "
+            "is genuinely not in doubt for reasons in `truth_here` — their "
+            "skill, their tools, the state of the place — or set "
+            '"uncertain":true and write both branches in the ledger\'s roll. '
+            "Saying it confidently is not one of the reasons."
+        )
+
+    def check_travel(self, opening: Opening, player_said: str, was_in: str) -> None:
+        """A declared journey that billed for the travel has to arrive.
+
+        Raising spends the spec 3.3 retry with the reason attached, which is
+        the only thing that recovers the turn: the resolver resolved the first
+        half of a compound action, charged the clock for the second, and
+        committed a `player_location` that contradicts both.
+
+        Deliberately narrow. It fires only when the player said they were
+        going somewhere, the clock moved by more than it takes to cross a
+        room, and they ended where they started. Each of those alone is
+        ordinary; together they cannot all be true.
+        """
+        if opening.player_location != was_in:
+            return
+        if opening.duration_minutes < TRAVEL_MINUTES:
+            return
+        if not declares_travel(player_said):
+            return
+        raise ValueError(
+            f"player_location is {was_in!r}, which is where they already were, "
+            f"but this turn takes {opening.duration_minutes:.0f} minutes and "
+            "they said they were going somewhere. Pick one. Either they got "
+            "there — set player_location to the destination, creating it in "
+            "new_entities inside a place that already exists — or they never "
+            "set off, and duration_minutes is only the minute or two it took "
+            "to get as far as they got. Never both: a turn that charges for "
+            "the journey and does not move them leaves the world in the wrong "
+            "place, and every turn after it is wrong too."
+        )
 
     def check_deltas(self, ledger: Ledger, *settled_in: object) -> list[str]:
         """Deltas that cannot be applied, for the dev view and the log."""

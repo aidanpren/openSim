@@ -428,7 +428,11 @@ def test_the_instructions_stay_small():
     # contract rewritten. spawn.md: secrets, the clock, varied premises. About
     # 0.1c a turn, against a 2c budget, and the alternative was leaving the
     # playtest findings unfixed.
-    assert sizes["resolver.md"] < 2700, sizes
+    # Raised again for "the player never decides how it goes", after a live
+    # session typed "I successfuly get the money into my account" and the
+    # world agreed, twice, for twenty billion dollars. The vision's "not a
+    # yes-man" is worth a hundred and thirty tokens a turn.
+    assert sizes["resolver.md"] < 2900, sizes
     # narrator.md was raised a second time, in the same pass, for the one
     # defect the first playtest of it found: the outcome beat re-narrating the
     # attempt. Worth a hundred tokens, because the player notices it first.

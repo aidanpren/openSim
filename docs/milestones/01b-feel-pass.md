@@ -161,20 +161,26 @@ Five defects the offline tests could not have found. Each has a test now.
 
 ## Still open
 
-Findings 2–4 of the 30-turn run were out of scope and are unchanged, except
-where this work touched them. The 20-turn run reorders their priority:
+Findings 2 and 3 of the 30-turn run were out of scope and are unchanged,
+except where this work touched them.
 
-1. **Compound actions do not move the character** (finding 4). "I drive the
-   delivery over to the wedding venue" never left the shop. This is now the
-   worst thing in the game — it is the one defect that stops the world being
-   somewhere — and it should lead whatever comes next.
-2. **Four of twenty turns sent only the first object** (finding 2), up from
+**Fixed after the playtest, out of the original scope:** compound actions did
+not move the character (finding 4). "I drive the delivery over to the wedding
+venue" charged twenty-two minutes and left her at her own work table.
+`check_travel` refuses that opening and spends the retry; the resolver prompt
+now says the clock and the destination have to agree. Verified live on the
+same save, on the same two turns that broke: both arrive, and "Where am I?"
+answers with the venue and then the shop. Held by
+`test_a_journey_that_takes_time_has_to_arrive` and a parametrised test that
+the check stays narrow.
+
+1. **Four of twenty turns sent only the first object** (finding 2), up from
    three of thirty. It degrades better now, because the outcome beat fires
    from whatever committed rather than reading as a recap, but the dialogue in
    those turns is lost.
-3. **`contents` on a container is the most-dropped write**, four of eleven.
+2. **`contents` on a container is the most-dropped write**, four of eleven.
    Spec 2.1 refuses it as structural, and the resolver keeps wanting it for a
    glovebox or a mail stack where an entity per item would be absurd. This
    needs a decision, not a quiet loosening — see the open questions in the
    report.
-4. **Two people merged** in one answer and on the sheet.
+3. **Two people merged** in one answer and on the sheet.
